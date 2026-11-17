@@ -1,0 +1,268 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function isValidBook(data) {
+      return data.keys().hasAll([
+        'bookNumber', 'title', 'status', 'isActive', 'isDeleted',
+        'quantity', 'borrowCount', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'bookNumber', 'title', 'author', 'category', 'description',
+        'coverUrl', 'quantity', 'availableQuantity', 'status', 'isActive', 'isDeleted',
+        'currentTransactionId', 'currentBorrowerName', 'currentBorrowerGroup',
+        'currentBorrowerCourse', 'currentBorrowedAt', 'currentDueDate',
+        'borrowCount', 'createdAt', 'updatedAt'
+      ])
+      && data.bookNumber is string && data.bookNumber.size() >= 1 && data.bookNumber.size() <= 32
+      && data.title is string && data.title.size() >= 1 && data.title.size() <= 200
+      && (!('author' in data) || (data.author is string && data.author.size() <= 160))
+      && (!('category' in data) || (data.category is string && data.category.size() <= 80))
+      && (!('description' in data) || (data.description is string && data.description.size() <= 1000))
+      && (!('coverUrl' in data) || (data.coverUrl is string && data.coverUrl.size() <= 350000))
+      && data.quantity is number && data.quantity >= 0 && data.quantity <= 1000
+      && (!('availableQuantity' in data) || (data.availableQuantity is number && data.availableQuantity >= 0 && data.availableQuantity <= 1000))
+      && data.status in ['mavjud', 'olingan', 'faol_emas']
+      && data.isActive is bool
+      && data.isDeleted is bool
+      && data.borrowCount is number && data.borrowCount >= 0
+      && data.createdAt is string && data.createdAt.size() <= 64
+      && data.updatedAt is string && data.updatedAt.size() <= 64
+      && (!('currentTransactionId' in data) || (data.currentTransactionId is string && data.currentTransactionId.size() <= 128))
+      && (!('currentBorrowerName' in data) || (data.currentBorrowerName is string && data.currentBorrowerName.size() <= 160))
+      && (!('currentBorrowerGroup' in data) || (data.currentBorrowerGroup is string && data.currentBorrowerGroup.size() <= 64))
+      && (!('currentBorrowerCourse' in data) || (data.currentBorrowerCourse is string && data.currentBorrowerCourse.size() <= 32))
+      && (!('currentBorrowedAt' in data) || (data.currentBorrowedAt is string && data.currentBorrowedAt.size() <= 64))
+      && (!('currentDueDate' in data) || (data.currentDueDate is string && data.currentDueDate.size() <= 64));
+    }
+
+    function isValidStudent(data) {
+      return data.keys().hasAll([
+        'firstName', 'lastName', 'fullName', 'group', 'course',
+        'totalBorrowed', 'totalReturned', 'activeCount', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'firstName', 'lastName', 'fullName', 'group', 'course',
+        'totalBorrowed', 'totalReturned', 'activeCount', 'createdAt', 'updatedAt'
+      ])
+      && data.firstName is string && data.firstName.size() >= 1 && data.firstName.size() <= 80
+      && data.lastName is string && data.lastName.size() >= 1 && data.lastName.size() <= 80
+      && data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 160
+      && data.group is string && data.group.size() >= 1 && data.group.size() <= 64
+      && data.course is string && data.course.size() >= 1 && data.course.size() <= 32
+      && data.totalBorrowed is number && data.totalBorrowed >= 0
+      && data.totalReturned is number && data.totalReturned >= 0
+      && data.activeCount is number && data.activeCount >= 0
+      && data.createdAt is string && data.createdAt.size() <= 64
+      && data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    function isValidTransaction(data) {
+      return data.keys().hasAll([
+        'bookId', 'bookNumber', 'bookTitle', 'studentId',
+        'studentFirstName', 'studentLastName', 'studentFullName',
+        'studentGroup', 'studentCourse', 'type', 'status',
+        'borrowedAt', 'dueDate', 'createdAt'
+      ])
+      && data.keys().hasOnly([
+        'bookId', 'bookNumber', 'bookTitle', 'studentId',
+        'studentFirstName', 'studentLastName', 'studentFullName',
+        'studentGroup', 'studentCourse', 'type', 'status',
+        'borrowedAt', 'dueDate', 'returnedAt',
+        'borrowSignatureId', 'returnSignatureId', 'faceProfileId', 'adminOverride', 'createdAt'
+      ])
+      && data.bookId is string && data.bookId.size() >= 1 && data.bookId.size() <= 128
+      && data.bookNumber is string && data.bookNumber.size() >= 1 && data.bookNumber.size() <= 32
+      && data.bookTitle is string && data.bookTitle.size() >= 1 && data.bookTitle.size() <= 200
+      && data.studentId is string && data.studentId.size() >= 1 && data.studentId.size() <= 128
+      && data.studentFirstName is string && data.studentFirstName.size() >= 1 && data.studentFirstName.size() <= 80
+      && data.studentLastName is string && data.studentLastName.size() >= 1 && data.studentLastName.size() <= 80
+      && data.studentFullName is string && data.studentFullName.size() >= 1 && data.studentFullName.size() <= 160
+      && data.studentGroup is string && data.studentGroup.size() >= 1 && data.studentGroup.size() <= 64
+      && data.studentCourse is string && data.studentCourse.size() >= 1 && data.studentCourse.size() <= 32
+      && data.type in ['borrow', 'return']
+      && data.status in ['active', 'returned']
+      && data.borrowedAt is string && data.borrowedAt.size() <= 64
+      && data.dueDate is string && data.dueDate.size() <= 64
+      && (!('returnedAt' in data) || (data.returnedAt is string && data.returnedAt.size() <= 64))
+      && (!('borrowSignatureId' in data) || (data.borrowSignatureId is string && data.borrowSignatureId.size() <= 128))
+      && (!('returnSignatureId' in data) || (data.returnSignatureId is string && data.returnSignatureId.size() <= 128))
+      && (!('faceProfileId' in data) || (data.faceProfileId is string && data.faceProfileId.size() <= 128))
+      && (!('adminOverride' in data) || data.adminOverride is bool)
+      && data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    function isValidSignature(data) {
+      return data.keys().hasAll([
+        'transactionId', 'studentId', 'studentFullName',
+        'bookId', 'bookNumber', 'actionType', 'imageDataUrl', 'createdAt'
+      ])
+      && data.keys().hasOnly([
+        'transactionId', 'studentId', 'studentFullName',
+        'bookId', 'bookNumber', 'actionType', 'imageDataUrl', 'createdAt'
+      ])
+      && data.transactionId is string && data.transactionId.size() >= 1 && data.transactionId.size() <= 128
+      && data.studentId is string && data.studentId.size() >= 1 && data.studentId.size() <= 128
+      && data.studentFullName is string && data.studentFullName.size() >= 1 && data.studentFullName.size() <= 160
+      && data.bookId is string && data.bookId.size() >= 1 && data.bookId.size() <= 128
+      && data.bookNumber is string && data.bookNumber.size() >= 1 && data.bookNumber.size() <= 32
+      && data.actionType in ['borrow', 'return']
+      && data.imageDataUrl is string && data.imageDataUrl.size() >= 20 && data.imageDataUrl.size() <= 200000
+      && data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    function isValidAdmin(data) {
+      return data.keys().hasAll([
+        'username', 'passwordHash', 'salt', 'algorithm',
+        'iterations', 'mustChangePassword', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'username', 'passwordHash', 'salt', 'algorithm',
+        'iterations', 'mustChangePassword', 'updatedAt'
+      ])
+      && data.username is string && data.username.size() >= 1 && data.username.size() <= 64
+      && data.passwordHash is string && data.passwordHash.size() >= 32 && data.passwordHash.size() <= 256
+      && data.salt is string && data.salt.size() >= 16 && data.salt.size() <= 128
+      && data.algorithm is string && data.algorithm.size() <= 32
+      && data.iterations is number && data.iterations >= 10000
+      && data.mustChangePassword is bool
+      && data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    function isValidActivityLog(data) {
+      return data.keys().hasAll([
+        'action', 'targetType', 'targetId', 'targetLabel', 'details', 'actor', 'createdAt'
+      ])
+      && data.keys().hasOnly([
+        'action', 'targetType', 'targetId', 'targetLabel', 'details', 'actor', 'createdAt'
+      ])
+      && data.action is string && data.action.size() >= 1 && data.action.size() <= 120
+      && data.targetType is string && data.targetType.size() >= 1 && data.targetType.size() <= 48
+      && data.targetId is string && data.targetId.size() <= 128
+      && data.targetLabel is string && data.targetLabel.size() <= 200
+      && data.details is string && data.details.size() <= 500
+      && data.actor is string && data.actor.size() <= 80
+      && data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    function isValidSettings(data) {
+      return data.keys().hasAll([
+        'institutionName', 'libraryName', 'defaultLoanDays', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'institutionName', 'libraryName', 'defaultLoanDays', 'lastBackupAt', 'updatedAt'
+      ])
+      && data.institutionName is string && data.institutionName.size() >= 1 && data.institutionName.size() <= 200
+      && data.libraryName is string && data.libraryName.size() >= 1 && data.libraryName.size() <= 200
+      && data.defaultLoanDays is number && data.defaultLoanDays >= 1 && data.defaultLoanDays <= 365
+      && (!('lastBackupAt' in data) || (data.lastBackupAt is string && data.lastBackupAt.size() <= 64))
+      && data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    match /books/{bookId} {
+      allow get, list: if true;
+      allow create, update: if isValidId(bookId) && isValidBook(incoming());
+      allow delete: if isValidId(bookId);
+    }
+
+    match /students/{studentId} {
+      allow get, list: if true;
+      allow create, update: if isValidId(studentId) && isValidStudent(incoming());
+      allow delete: if isValidId(studentId);
+    }
+
+    match /transactions/{transactionId} {
+      allow get, list: if true;
+      allow create, update: if isValidId(transactionId) && isValidTransaction(incoming());
+      allow delete: if isValidId(transactionId);
+    }
+
+    match /signatures/{signatureId} {
+      allow get, list: if true;
+      allow create: if isValidId(signatureId) && isValidSignature(incoming());
+      allow update, delete: if false;
+    }
+
+    match /admins/{adminId} {
+      allow get: if isValidId(adminId);
+      allow list: if false;
+      allow create, update: if isValidId(adminId) && isValidAdmin(incoming());
+      allow delete: if false;
+    }
+
+    match /activityLogs/{logId} {
+      allow get, list: if true;
+      allow create: if isValidId(logId) && isValidActivityLog(incoming());
+      allow update, delete: if false;
+    }
+
+    function isValidQrUpload(data) {
+      return data.keys().hasAll(['status', 'createdAt', 'updatedAt'])
+      && data.keys().hasOnly(['status', 'imageDataUrl', 'createdAt', 'updatedAt'])
+      && data.status in ['waiting', 'uploaded']
+      && (!('imageDataUrl' in data) || (data.imageDataUrl is string && data.imageDataUrl.size() <= 350000))
+      && data.createdAt is string && data.createdAt.size() <= 64
+      && data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    function isValidFaceProfile(data) {
+      return data.keys().hasAll([
+        'nameKey', 'groupKey', 'firstName', 'lastName', 'fullName',
+        'group', 'course', 'facePhotoUrl', 'faceDescriptor', 'descriptorHash',
+        'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'nameKey', 'groupKey', 'firstName', 'lastName', 'fullName',
+        'group', 'course', 'facePhotoUrl', 'faceDescriptor', 'descriptorHash',
+        'createdAt', 'updatedAt'
+      ])
+      && data.nameKey is string && data.nameKey.size() >= 1 && data.nameKey.size() <= 160
+      && data.groupKey is string && data.groupKey.size() >= 1 && data.groupKey.size() <= 64
+      && data.firstName is string && data.firstName.size() >= 1 && data.firstName.size() <= 80
+      && data.lastName is string && data.lastName.size() >= 1 && data.lastName.size() <= 80
+      && data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 160
+      && data.group is string && data.group.size() >= 1 && data.group.size() <= 64
+      && data.course is string && data.course.size() >= 1 && data.course.size() <= 32
+      && data.facePhotoUrl is string && data.facePhotoUrl.size() >= 20 && data.facePhotoUrl.size() <= 150000
+      && data.faceDescriptor is list && data.faceDescriptor.size() == 128
+      && data.faceDescriptor[0] is number && data.faceDescriptor[127] is number
+      && data.descriptorHash is string && data.descriptorHash.size() == 64
+      && data.createdAt is string && data.createdAt.size() <= 64
+      && data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    match /faceProfiles/{profileId} {
+      allow get: if isValidId(profileId);
+      allow list: if request.query.limit <= 10;
+      allow create: if isValidId(profileId) && isValidFaceProfile(incoming());
+      allow update: if false;
+      allow delete: if isValidId(profileId);
+    }
+
+    match /settings/{settingId} {
+      allow get: if isValidId(settingId);
+      allow list: if false;
+      allow create, update: if isValidId(settingId) && isValidSettings(incoming());
+      allow delete: if false;
+    }
+
+    match /qrUploads/{sessionId} {
+      allow get: if isValidId(sessionId);
+      allow list: if false;
+      allow create, update: if isValidId(sessionId) && isValidQrUpload(incoming());
+      allow delete: if isValidId(sessionId);
+    }
+  }
+}

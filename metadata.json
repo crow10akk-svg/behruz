@@ -1,0 +1,10 @@
+{
+  "name": "IIV Andijon Akademik Litseyi — Smart Kutubxona",
+  "description": "IIV Andijon akademik litseyi uchun sensorli monitor va admin boshqaruviga ega elektron kutubxona platformasi.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

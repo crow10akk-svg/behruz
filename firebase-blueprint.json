@@ -1,0 +1,268 @@
+{
+  "entities": {
+    "Book": {
+      "title": "Book",
+      "description": "Library catalog item managed exclusively by administrators",
+      "type": "object",
+      "properties": {
+        "bookNumber": {
+          "type": "string",
+          "description": "Unique inventory number such as 001, 002",
+          "minLength": 1,
+          "maxLength": 32,
+          "pattern": "^[a-zA-Z0-9_-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "author": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "category": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "coverUrl": {
+          "type": "string",
+          "maxLength": 350000
+        },
+        "quantity": {
+          "type": "number"
+        },
+        "availableQuantity": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["mavjud", "olingan", "faol_emas"]
+        },
+        "isActive": {
+          "type": "boolean"
+        },
+        "isDeleted": {
+          "type": "boolean"
+        },
+        "currentTransactionId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "currentBorrowerName": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "currentBorrowerGroup": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "currentBorrowerCourse": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "currentBorrowedAt": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "currentDueDate": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "borrowCount": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "updatedAt": {
+          "type": "string",
+          "maxLength": 64
+        }
+      },
+      "required": ["bookNumber", "title", "status", "isActive", "isDeleted", "quantity", "borrowCount", "createdAt", "updatedAt"]
+    },
+    "Student": {
+      "title": "Student",
+      "description": "Student borrower profile and aggregated circulation counts",
+      "type": "object",
+      "properties": {
+        "firstName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "lastName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "fullName": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "group": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "course": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "totalBorrowed": { "type": "number" },
+        "totalReturned": { "type": "number" },
+        "activeCount": { "type": "number" },
+        "createdAt": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["firstName", "lastName", "fullName", "group", "course", "totalBorrowed", "totalReturned", "activeCount", "createdAt", "updatedAt"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "Book borrow and return circulation record",
+      "type": "object",
+      "properties": {
+        "bookId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "bookNumber": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "bookTitle": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "studentId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "studentFirstName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "studentLastName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "studentFullName": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "studentGroup": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "studentCourse": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "type": { "type": "string", "enum": ["borrow", "return"] },
+        "status": { "type": "string", "enum": ["active", "returned"] },
+        "borrowedAt": { "type": "string", "maxLength": 64 },
+        "dueDate": { "type": "string", "maxLength": 64 },
+        "returnedAt": { "type": "string", "maxLength": 64 },
+        "borrowSignatureId": { "type": "string", "maxLength": 128 },
+        "returnSignatureId": { "type": "string", "maxLength": 128 },
+        "faceProfileId": { "type": "string", "maxLength": 128 },
+        "adminOverride": { "type": "boolean" },
+        "createdAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["bookId", "bookNumber", "bookTitle", "studentId", "studentFirstName", "studentLastName", "studentFullName", "studentGroup", "studentCourse", "type", "status", "borrowedAt", "dueDate", "createdAt"]
+    },
+    "FaceProfile": {
+      "title": "FaceProfile",
+      "description": "Permanent biometric Face ID profile (cropped face photo + 128-D geometry vector + SHA-256 integrity hash) bound to student identity",
+      "type": "object",
+      "properties": {
+        "nameKey": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "groupKey": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "firstName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "lastName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "fullName": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "group": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "course": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "facePhotoUrl": { "type": "string", "minLength": 20, "maxLength": 150000 },
+        "faceDescriptor": {
+          "type": "array",
+          "items": { "type": "number" }
+        },
+        "descriptorHash": { "type": "string", "minLength": 64, "maxLength": 128 },
+        "createdAt": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["nameKey", "groupKey", "firstName", "lastName", "fullName", "group", "course", "facePhotoUrl", "faceDescriptor", "descriptorHash", "createdAt", "updatedAt"]
+    },
+    "Signature": {
+      "title": "Signature",
+      "description": "Electronic signature image stored separately from transactions",
+      "type": "object",
+      "properties": {
+        "transactionId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "studentId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "studentFullName": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "bookId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "bookNumber": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "actionType": { "type": "string", "enum": ["borrow", "return"] },
+        "imageDataUrl": { "type": "string", "minLength": 20, "maxLength": 200000 },
+        "createdAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["transactionId", "studentId", "studentFullName", "bookId", "bookNumber", "actionType", "imageDataUrl", "createdAt"]
+    },
+    "AdminCredential": {
+      "title": "AdminCredential",
+      "description": "Salted PBKDF2-SHA256 admin credential record (never plaintext)",
+      "type": "object",
+      "properties": {
+        "username": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "passwordHash": { "type": "string", "minLength": 32, "maxLength": 256 },
+        "salt": { "type": "string", "minLength": 16, "maxLength": 128 },
+        "algorithm": { "type": "string", "maxLength": 32 },
+        "iterations": { "type": "number" },
+        "mustChangePassword": { "type": "boolean" },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["username", "passwordHash", "salt", "algorithm", "iterations", "mustChangePassword", "updatedAt"]
+    },
+    "ActivityLog": {
+      "title": "ActivityLog",
+      "description": "Immutable admin action audit trail",
+      "type": "object",
+      "properties": {
+        "action": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "targetType": { "type": "string", "minLength": 1, "maxLength": 48 },
+        "targetId": { "type": "string", "maxLength": 128 },
+        "targetLabel": { "type": "string", "maxLength": 200 },
+        "details": { "type": "string", "maxLength": 500 },
+        "actor": { "type": "string", "maxLength": 80 },
+        "createdAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["action", "targetType", "targetId", "targetLabel", "details", "actor", "createdAt"]
+    },
+    "LibrarySetting": {
+      "title": "LibrarySetting",
+      "description": "Institutional library configuration and backup timestamps",
+      "type": "object",
+      "properties": {
+        "institutionName": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "libraryName": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "defaultLoanDays": { "type": "number" },
+        "lastBackupAt": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["institutionName", "libraryName", "defaultLoanDays", "updatedAt"]
+    },
+    "QrUpload": {
+      "title": "QrUpload",
+      "description": "Temporary QR-code mobile photo transfer session for book covers",
+      "type": "object",
+      "properties": {
+        "status": { "type": "string", "enum": ["waiting", "uploaded"] },
+        "imageDataUrl": { "type": "string", "maxLength": 350000 },
+        "createdAt": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["status", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/books/{bookId}": {
+      "schema": { "$ref": "#/entities/Book" },
+      "description": "Library books catalog"
+    },
+    "/students/{studentId}": {
+      "schema": { "$ref": "#/entities/Student" },
+      "description": "Registered library student borrowers"
+    },
+    "/faceProfiles/{profileId}": {
+      "schema": { "$ref": "#/entities/FaceProfile" },
+      "description": "Protected student Face ID profiles with face descriptors and integrity hashes"
+    },
+    "/transactions/{transactionId}": {
+      "schema": { "$ref": "#/entities/Transaction" },
+      "description": "Borrow and return transaction records"
+    },
+    "/signatures/{signatureId}": {
+      "schema": { "$ref": "#/entities/Signature" },
+      "description": "Electronic signature images stored separately"
+    },
+    "/admins/{adminId}": {
+      "schema": { "$ref": "#/entities/AdminCredential" },
+      "description": "Hashed admin credentials"
+    },
+    "/activityLogs/{logId}": {
+      "schema": { "$ref": "#/entities/ActivityLog" },
+      "description": "Audit logs of admin actions"
+    },
+    "/settings/{settingId}": {
+      "schema": { "$ref": "#/entities/LibrarySetting" },
+      "description": "System-wide library configuration"
+    },
+    "/qrUploads/{sessionId}": {
+      "schema": { "$ref": "#/entities/QrUpload" },
+      "description": "QR photo upload session documents"
+    }
+  }
+}
