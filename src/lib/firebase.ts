@@ -4,8 +4,7 @@ import {
   getDocFromServer,
   getFirestore,
   initializeFirestore,
-  persistentLocalCache,
-  persistentMultipleTabManager,
+  memoryLocalCache,
   type Firestore,
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
@@ -17,9 +16,7 @@ function createFirestoreInstance(): Firestore {
     return initializeFirestore(
       app,
       {
-        localCache: persistentLocalCache({
-          tabManager: persistentMultipleTabManager(),
-        }),
+        localCache: memoryLocalCache(),
       },
       firebaseConfig.firestoreDatabaseId
     );
@@ -30,16 +27,42 @@ function createFirestoreInstance(): Firestore {
 
 export const db = createFirestoreInstance();
 
+export function isQuotaExceededError(err: unknown): boolean {
+  if (!err) return false;
+  const code =
+    typeof err === 'object' && 'code' in err ? String((err as { code?: unknown }).code || '') : '';
+  const msg = err instanceof Error ? err.message : String(err);
+  const combined = `${code} ${msg}`.toLowerCase();
+  return (
+    combined.includes('resource-exhausted') ||
+    combined.includes('quota limit exceeded') ||
+    combined.includes('quota exceeded') ||
+    combined.includes('free daily read units')
+  );
+}
+
+const CONN_CHECKED_SESSION_KEY = 'smart_kutubxona_conn_checked_v1';
+
 export async function testFirestoreConnection(): Promise<boolean> {
   try {
+    if (typeof sessionStorage !== 'undefined' && sessionStorage.getItem(CONN_CHECKED_SESSION_KEY) === '1') {
+      return true;
+    }
     await getDocFromServer(doc(db, 'settings', 'library'));
+    try {
+      sessionStorage.setItem(CONN_CHECKED_SESSION_KEY, '1');
+    } catch {
+      // Ignore sessionStorage restrictions
+    }
     return true;
   } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Firestore offline:', error.message);
+    if (isQuotaExceededError(error)) {
       return false;
     }
-    // Other errors (like missing doc) mean server responded
+    if (error instanceof Error && error.message.includes('the client is offline')) {
+      console.warn('Firestore offline:', error.message);
+      return false;
+    }
     return true;
   }
 }

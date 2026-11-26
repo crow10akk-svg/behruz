@@ -2,6 +2,7 @@ import {
   collection,
   deleteDoc,
   doc,
+  getCountFromServer,
   getDoc,
   getDocs,
   limit,
@@ -15,7 +16,8 @@ import {
   writeBatch,
   type Unsubscribe,
 } from 'firebase/firestore';
-import { db } from './firebase.ts';
+import { db, isQuotaExceededError } from './firebase.ts';
+import { loadCatalogCacheFromIdb, saveCatalogCacheToIdb } from './bookCache.ts';
 import { generateSalt, hashPassword, verifyPassword } from './crypto.ts';
 import {
   compareFaceDescriptors,
@@ -23,7 +25,16 @@ import {
   makeFaceProfileId,
   verifyFaceDescriptorIntegrity,
 } from './faceService.ts';
-import { makeSafeDocId, normalizeCompareText, normalizeGroupCompare, normalizeStudentId } from './imageUtils.ts';
+import {
+  DEFAULT_BOOK_COVER_URL,
+  makeSafeDocId,
+  normalizeCompareText,
+  normalizeGroupCompare,
+  normalizeStudentId,
+  toRelaxedPhonetic,
+  transliterateToLatinCanonical,
+} from './imageUtils.ts';
+import type { ParsedExcelBookRow } from './excelImport.ts';
 import type {
   ActivityLogRecord,
   AdminCredential,
@@ -47,83 +58,17 @@ export function getBookAvailableCount(
   return book.status === 'olingan' ? 0 : Math.max(1, book.quantity || 1);
 }
 
-const SEED_BOOKS: Array<Omit<Book, 'id' | 'createdAt' | 'updatedAt'>> = [
-  {
-    bookNumber: '001',
-    title: 'O‘zbekiston tarixi',
-    author: 'Prof. A. A. Karimov',
-    category: 'Tarix',
-    description:
-      'Akademik litseylar uchun O‘zbekiston davlatchiligi va madaniy merosi tarixiga bag‘ishlangan asosiy o‘quv qo‘llanma.',
-    coverUrl: '/src/assets/images/book_uzbekistan_history_1794839462817.jpg',
-    quantity: 1,
-    availableQuantity: 1,
-    status: 'mavjud',
-    isActive: true,
-    isDeleted: false,
-    borrowCount: 0,
-  },
-  {
-    bookNumber: '002',
-    title: 'Konstitutsiyaviy huquq va huquqshunoslik',
-    author: 'Dr. M. R. Qodirov',
-    category: 'Huquqshunoslik',
-    description:
-      'IIV akademik litseylari o‘quvchilari uchun davlat va huquq nazariyasi hamda konstitutsiyaviy asoslar darsligi.',
-    coverUrl: '/src/assets/images/book_constitutional_law_1794839463531.jpg',
-    quantity: 1,
-    availableQuantity: 1,
-    status: 'mavjud',
-    isActive: true,
-    isDeleted: false,
-    borrowCount: 0,
-  },
-  {
-    bookNumber: '003',
-    title: 'Axborot texnologiyalari va kiberxavfsizlik',
-    author: 'Dots. S. T. Alimov',
-    category: 'Informatika',
-    description:
-      'Zamonaviy kompyuter tizimlari, tarmoq xavfsizligi va raqamli savodxonlik bo‘yicha amaliy qo‘llanma.',
-    coverUrl: '/src/assets/images/book_informatics_1794839463452.jpg',
-    quantity: 1,
-    availableQuantity: 1,
-    status: 'mavjud',
-    isActive: true,
-    isDeleted: false,
-    borrowCount: 0,
-  },
-  {
-    bookNumber: '004',
-    title: 'Ingliz tili va akademik yozuv',
-    author: 'D. H. Tursunova',
-    category: 'Xorijiy tillar',
-    description:
-      'Akademik litsey o‘quvchilari uchun ingliz tili grammatikasi, leksikasi va huquqiy atamalar to‘plami.',
-    coverUrl: '/src/assets/images/book_english_grammar_1794839464428.jpg',
-    quantity: 1,
-    availableQuantity: 1,
-    status: 'mavjud',
-    isActive: true,
-    isDeleted: false,
-    borrowCount: 0,
-  },
-  {
-    bookNumber: '005',
-    title: 'O‘zbek mumtoz adabiyoti xazinasi',
-    author: 'Akad. N. Karimov tahriri ostida',
-    category: 'Adabiyot',
-    description:
-      'Alisher Navoiy, Bobur va jadid adiblarining sara asarlari hamda tahliliy sharhlari jamlanmasi.',
-    coverUrl: '/src/assets/images/book_uzbek_literature_1794839462997.jpg',
-    quantity: 1,
-    availableQuantity: 1,
-    status: 'mavjud',
-    isActive: true,
-    isDeleted: false,
-    borrowCount: 0,
-  },
-];
+const EXCLUSIVE_NEW_BOOK_CUTOFF = '2026-11-25T10:25:00.000Z';
+
+function isAllowedFirestoreBook(
+  id: string,
+  book: Pick<Book, 'createdAt'>,
+  bundledMap: Map<string, Book>
+): boolean {
+  if (bundledMap.has(id)) return true;
+  if (id.startsWith('book_seed_')) return false;
+  return (book.createdAt || '') >= EXCLUSIVE_NEW_BOOK_CUTOFF;
+}
 
 export async function logAdminActivity(params: {
   action: string;
@@ -159,41 +104,73 @@ export function logAdminActivityNonBlocking(params: {
   });
 }
 
+const ADMIN_CRED_CACHE_KEY = 'smart_kutubxona_admin_cred_v1';
+const APP_GATE_CRED_CACHE_KEY = 'smart_kutubxona_gate_cred_v1';
+
+function readCachedCredential(key: string): AdminCredential | null {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as AdminCredential;
+    return parsed && parsed.passwordHash && parsed.salt ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedCredential(key: string, cred: AdminCredential): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(cred));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
 let seedPromise: Promise<void> | null = null;
-let adminCredCache: AdminCredential | null = null;
-let appGateCredCache: AdminCredential | null = null;
+let adminCredCache: AdminCredential | null = readCachedCredential(ADMIN_CRED_CACHE_KEY);
+let appGateCredCache: AdminCredential | null = readCachedCredential(APP_GATE_CRED_CACHE_KEY);
 
 // Precomputed PBKDF2-SHA256 fallback ONLY for cold-boot offline before Firestore caches admins/app_gate
 const OFFLINE_APP_GATE_SALT = 'a7c4e91f0b2d8e31c5a67f09d1248b3c';
 const OFFLINE_APP_GATE_ITERATIONS = 100000;
 let offlineAppGateHashPromise: Promise<string> | null = null;
 
-async function ensureAppGateCredential(): Promise<AdminCredential> {
-  if (appGateCredCache) return appGateCredCache;
-  const appGateRef = doc(db, 'admins', 'app_gate');
-  const snap = await getDoc(appGateRef);
-  const data = snap.exists() ? (snap.data() as AdminCredential) : null;
-  if (data && data.algorithm === 'PBKDF2-SHA256-APPGATE') {
-    appGateCredCache = data;
-    return data;
+async function ensureAppGateCredential(forceRemote = false): Promise<AdminCredential> {
+  if (!forceRemote && appGateCredCache && !navigator.onLine) {
+    return appGateCredCache;
   }
 
-  const now = new Date().toISOString();
-  const salt = generateSalt();
-  const iterations = 100000;
-  const hashed = await hashPassword('kutubxona', salt, iterations);
-  const gateDoc: AdminCredential = {
-    username: 'app_gate',
-    passwordHash: hashed,
-    salt,
-    algorithm: 'PBKDF2-SHA256-APPGATE',
-    iterations,
-    mustChangePassword: false,
-    updatedAt: now,
-  };
-  await setDoc(appGateRef, gateDoc);
-  appGateCredCache = gateDoc;
-  return gateDoc;
+  const appGateRef = doc(db, 'admins', 'app_gate');
+  try {
+    const snap = await getDoc(appGateRef);
+    const data = snap.exists() ? (snap.data() as AdminCredential) : null;
+    if (data && data.algorithm === 'PBKDF2-SHA256-APPGATE') {
+      appGateCredCache = data;
+      writeCachedCredential(APP_GATE_CRED_CACHE_KEY, data);
+      return data;
+    }
+
+    const now = new Date().toISOString();
+    const salt = generateSalt();
+    const iterations = 100000;
+    const hashed = await hashPassword('kutubxona', salt, iterations);
+    const gateDoc: AdminCredential = {
+      username: 'app_gate',
+      passwordHash: hashed,
+      salt,
+      algorithm: 'PBKDF2-SHA256-APPGATE',
+      iterations,
+      mustChangePassword: false,
+      updatedAt: now,
+    };
+    await setDoc(appGateRef, gateDoc);
+    appGateCredCache = gateDoc;
+    writeCachedCredential(APP_GATE_CRED_CACHE_KEY, gateDoc);
+    return gateDoc;
+  } catch (err) {
+    if (appGateCredCache) return appGateCredCache;
+    throw err;
+  }
 }
 
 export function warmAppGateCredential(): void {
@@ -211,6 +188,7 @@ export function warmAdminCredential(): void {
         const data = snap.data() as AdminCredential;
         if (data.algorithm === 'PBKDF2-SHA256-SHARED') {
           adminCredCache = data;
+          writeCachedCredential(ADMIN_CRED_CACHE_KEY, data);
         }
       }
     })
@@ -227,11 +205,10 @@ export function ensureSeededDatabase(): Promise<void> {
     const appGateRef = doc(db, 'admins', 'app_gate');
     const settingsRef = doc(db, 'settings', 'library');
 
-    const [adminSnap, appGateSnap, settingsSnap, booksSampleSnap] = await Promise.all([
+    const [adminSnap, appGateSnap, settingsSnap] = await Promise.all([
       getDoc(adminRef),
       getDoc(appGateRef),
       getDoc(settingsRef),
-      getDocs(query(collection(db, 'books'), limit(1))),
     ]);
 
     const writeTasks: Promise<void>[] = [];
@@ -252,9 +229,11 @@ export function ensureSeededDatabase(): Promise<void> {
         updatedAt: now,
       };
       adminCredCache = adminDoc;
+      writeCachedCredential(ADMIN_CRED_CACHE_KEY, adminDoc);
       writeTasks.push(setDoc(adminRef, adminDoc));
     } else {
       adminCredCache = existingAdmin;
+      writeCachedCredential(ADMIN_CRED_CACHE_KEY, existingAdmin);
     }
 
     // 1b. Seed universal app-entry gate password ('kutubxona')
@@ -273,9 +252,11 @@ export function ensureSeededDatabase(): Promise<void> {
         updatedAt: now,
       };
       appGateCredCache = gateDoc;
+      writeCachedCredential(APP_GATE_CRED_CACHE_KEY, gateDoc);
       writeTasks.push(setDoc(appGateRef, gateDoc));
     } else {
       appGateCredCache = existingGate;
+      writeCachedCredential(APP_GATE_CRED_CACHE_KEY, existingGate);
     }
 
     // 2. Seed library settings if missing
@@ -289,20 +270,6 @@ export function ensureSeededDatabase(): Promise<void> {
       writeTasks.push(setDoc(settingsRef, settingDoc));
     }
 
-    // 3. Seed sample books only when books collection is completely empty
-    if (booksSampleSnap.empty) {
-      const batch = writeBatch(db);
-      SEED_BOOKS.forEach((book, idx) => {
-        const bookId = `book_seed_${String(idx + 1).padStart(3, '0')}`;
-        batch.set(doc(db, 'books', bookId), {
-          ...book,
-          createdAt: now,
-          updatedAt: now,
-        });
-      });
-      writeTasks.push(batch.commit());
-    }
-
     if (writeTasks.length > 0) {
       await Promise.all(writeTasks);
     }
@@ -314,51 +281,508 @@ export function ensureSeededDatabase(): Promise<void> {
   return seedPromise;
 }
 
-export function subscribeBooks(
-  onData: (books: Book[]) => void,
-  onError: (err: Error) => void
-): Unsubscribe {
-  const q = query(collection(db, 'books'), orderBy('bookNumber', 'asc'));
-  return onSnapshot(
-    q,
-    (snap) => {
-      const items: Book[] = [];
-      snap.forEach((d) => {
-        const data = d.data() as Omit<Book, 'id'>;
-        if (!data.isDeleted) {
-          items.push({ id: d.id, ...data });
-        }
-      });
-      items.sort((a, b) => a.bookNumber.localeCompare(b.bookNumber, undefined, { numeric: true }));
-      onData(items);
-    },
-    (err) => onError(err)
-  );
+function normalizeBookDoc(id: string, raw: Record<string, unknown>): Book {
+  const bookNumberRaw = raw.bookNumber;
+  const bookNumber =
+    typeof bookNumberRaw === 'string' && bookNumberRaw.trim()
+      ? bookNumberRaw.trim()
+      : bookNumberRaw !== undefined && bookNumberRaw !== null && String(bookNumberRaw).trim()
+        ? String(bookNumberRaw).trim()
+        : id;
+
+  const qtyRaw = Number(raw.quantity);
+  const quantity = Number.isFinite(qtyRaw) && qtyRaw >= 0 ? qtyRaw : 1;
+
+  const availRaw =
+    raw.availableQuantity !== undefined && raw.availableQuantity !== null
+      ? Number(raw.availableQuantity)
+      : undefined;
+  const availableQuantity =
+    availRaw !== undefined && Number.isFinite(availRaw) && availRaw >= 0 ? availRaw : undefined;
+
+  const createdAt =
+    typeof raw.createdAt === 'string' && raw.createdAt ? raw.createdAt : '1970-01-01T00:00:00.000Z';
+  const updatedAt =
+    typeof raw.updatedAt === 'string' && raw.updatedAt ? raw.updatedAt : createdAt;
+
+  const statusRaw = raw.status;
+  const status: Book['status'] =
+    statusRaw === 'olingan' || statusRaw === 'faol_emas' ? statusRaw : 'mavjud';
+
+  return {
+    id,
+    bookNumber,
+    title: typeof raw.title === 'string' ? raw.title : String(raw.title ?? 'Nomsiz kitob'),
+    author: typeof raw.author === 'string' ? raw.author : String(raw.author ?? ''),
+    category: typeof raw.category === 'string' && raw.category ? raw.category : 'Umumiy',
+    description: typeof raw.description === 'string' ? raw.description : '',
+    coverUrl: typeof raw.coverUrl === 'string' ? raw.coverUrl : '',
+    quantity,
+    ...(availableQuantity !== undefined ? { availableQuantity } : {}),
+    status,
+    isActive: raw.isActive !== false,
+    isDeleted: raw.isDeleted === true,
+    borrowCount: Number.isFinite(Number(raw.borrowCount)) ? Number(raw.borrowCount) : 0,
+    currentTransactionId:
+      typeof raw.currentTransactionId === 'string' ? raw.currentTransactionId : undefined,
+    currentBorrowerName:
+      typeof raw.currentBorrowerName === 'string' ? raw.currentBorrowerName : undefined,
+    currentBorrowerGroup:
+      typeof raw.currentBorrowerGroup === 'string' ? raw.currentBorrowerGroup : undefined,
+    currentBorrowerCourse:
+      typeof raw.currentBorrowerCourse === 'string' ? raw.currentBorrowerCourse : undefined,
+    currentBorrowedAt:
+      typeof raw.currentBorrowedAt === 'string' ? raw.currentBorrowedAt : undefined,
+    currentDueDate: typeof raw.currentDueDate === 'string' ? raw.currentDueDate : undefined,
+    createdAt,
+    updatedAt,
+  };
 }
 
+const bookNumberCollator = new Intl.Collator(undefined, { numeric: true });
+
+function compareBookNumbersFast(aRaw: string, bRaw: string): number {
+  const a = String(aRaw ?? '');
+  const b = String(bRaw ?? '');
+  if (a === b) return 0;
+  const na = Number(a);
+  const nb = Number(b);
+  if (Number.isFinite(na) && Number.isFinite(nb) && a.length > 0 && b.length > 0) {
+    return na !== nb ? na - nb : a.length - b.length;
+  }
+  return bookNumberCollator.compare(a, b);
+}
+
+let bundledCatalogCache: Map<string, Book> | null = null;
+let bundledCatalogPromise: Promise<Map<string, Book>> | null = null;
+
+export function loadBundledCatalog(): Promise<Map<string, Book>> {
+  if (bundledCatalogCache) return Promise.resolve(bundledCatalogCache);
+  if (bundledCatalogPromise) return bundledCatalogPromise;
+  if (typeof fetch === 'undefined') return Promise.resolve(new Map<string, Book>());
+
+  bundledCatalogPromise = fetch('/data/library-catalog.json')
+    .then(async (res) => {
+      if (!res.ok) return new Map<string, Book>();
+      const rawArr = (await res.json()) as Record<string, unknown>[];
+      const map = new Map<string, Book>();
+      if (Array.isArray(rawArr)) {
+        for (const item of rawArr) {
+          const id = typeof item.id === 'string' ? item.id : '';
+          if (!id) continue;
+          const normalized = normalizeBookDoc(id, item);
+          if (!normalized.isDeleted) {
+            map.set(id, normalized);
+          }
+        }
+      }
+      bundledCatalogCache = map;
+      return map;
+    })
+    .catch(() => new Map<string, Book>());
+
+  return bundledCatalogPromise;
+}
+
+async function getBundledBookById(bookId: string): Promise<Book | null> {
+  if (!bookId) return null;
+  const map = await loadBundledCatalog();
+  return map.get(bookId) || null;
+}
+
+function sanitizeBookForFirestore(b: Omit<Book, 'id'>): Omit<Book, 'id'> {
+  const qty = Math.max(0, Math.min(1000, Math.round(Number(b.quantity) || 1)));
+  const avail =
+    b.availableQuantity !== undefined
+      ? Math.max(0, Math.min(1000, Math.round(Number(b.availableQuantity) || 0)))
+      : qty;
+  const status: Book['status'] =
+    b.status === 'olingan' || b.status === 'faol_emas' ? b.status : 'mavjud';
+
+  const docData: Omit<Book, 'id'> = {
+    bookNumber: String(b.bookNumber || '001').trim().slice(0, 32) || '001',
+    title: String(b.title || 'Nomsiz kitob').trim().slice(0, 200) || 'Nomsiz kitob',
+    author: String(b.author || '').trim().slice(0, 160),
+    category: (String(b.category || 'Umumiy').trim() || 'Umumiy').slice(0, 80),
+    description: String(b.description || '').trim().slice(0, 1000),
+    coverUrl: ((b.coverUrl || '').trim() || DEFAULT_BOOK_COVER_URL).slice(0, 350000),
+    quantity: qty,
+    availableQuantity: avail,
+    status,
+    isActive: b.isActive !== false,
+    isDeleted: b.isDeleted === true,
+    borrowCount: Math.max(0, Math.round(Number(b.borrowCount) || 0)),
+    createdAt: String(b.createdAt || new Date().toISOString()).slice(0, 64),
+    updatedAt: String(b.updatedAt || new Date().toISOString()).slice(0, 64),
+  };
+
+  if (b.currentTransactionId) docData.currentTransactionId = String(b.currentTransactionId).slice(0, 128);
+  if (b.currentBorrowerName) docData.currentBorrowerName = String(b.currentBorrowerName).slice(0, 160);
+  if (b.currentBorrowerGroup) docData.currentBorrowerGroup = String(b.currentBorrowerGroup).slice(0, 64);
+  if (b.currentBorrowerCourse) docData.currentBorrowerCourse = String(b.currentBorrowerCourse).slice(0, 32);
+  if (b.currentBorrowedAt) docData.currentBorrowedAt = String(b.currentBorrowedAt).slice(0, 64);
+  if (b.currentDueDate) docData.currentDueDate = String(b.currentDueDate).slice(0, 64);
+
+  return docData;
+}
+
+export async function upsertBookDoc(
+  bookId: string,
+  baseBook: Omit<Book, 'id'>,
+  patch: Record<string, unknown>
+): Promise<void> {
+  const ref = doc(db, 'books', bookId);
+  const existingSnap = await getDoc(ref);
+  if (existingSnap.exists()) {
+    await updateDoc(ref, patch);
+  } else {
+    const merged = sanitizeBookForFirestore({
+      ...baseBook,
+      ...(patch as Partial<Omit<Book, 'id'>>),
+    });
+    await setDoc(ref, merged);
+  }
+}
+
+export function subscribeBooks(
+  onData: (books: Book[]) => void,
+  onError: (err: Error) => void,
+  initialCachedBooks: Book[] = [],
+  onDeletedData?: (deletedBooks: Book[]) => void
+): Unsubscribe {
+  let cancelled = false;
+  let unsubDelta: Unsubscribe | null = null;
+  let bundledMap = new Map<string, Book>();
+  const bookMap = new Map<string, Book>();
+  const knownDocIds = new Set<string>();
+  const deletedDocIds = new Set<string>();
+  let maxUpdatedAt = '';
+  let fullSyncDone = false;
+
+  let hasEmittedOnce = false;
+  let emitTimer: ReturnType<typeof setTimeout> | null = null;
+  let idbTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const getPartitionedItems = (): { active: Book[]; deleted: Book[] } => {
+    const mergedActive = new Map<string, Book>();
+    const mergedDeleted = new Map<string, Book>();
+
+    for (const [id, b] of bundledMap) {
+      if (b.isDeleted || deletedDocIds.has(id)) {
+        mergedDeleted.set(id, { ...b, isDeleted: true, isActive: false });
+      } else {
+        mergedActive.set(id, b);
+      }
+    }
+
+    for (const [id, b] of bookMap) {
+      if (!isAllowedFirestoreBook(id, b, bundledMap)) continue;
+      if (b.isDeleted || deletedDocIds.has(id)) {
+        mergedActive.delete(id);
+        mergedDeleted.set(id, { ...b, isDeleted: true });
+      } else {
+        mergedDeleted.delete(id);
+        mergedActive.set(id, b);
+      }
+    }
+
+    const active = Array.from(mergedActive.values());
+    active.sort((a, b) => compareBookNumbersFast(a.bookNumber, b.bookNumber));
+
+    const deleted = Array.from(mergedDeleted.values());
+    deleted.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+
+    return { active, deleted };
+  };
+
+  const persistIdbNow = () => {
+    void saveCatalogCacheToIdb({
+      books: Array.from(bookMap.values()),
+      knownDocIds: Array.from(knownDocIds),
+      deletedIds: Array.from(deletedDocIds),
+      maxUpdatedAt,
+      fullSyncDone,
+      savedAt: new Date().toISOString(),
+    });
+  };
+
+  const schedulePersistIdb = () => {
+    if (!fullSyncDone) return;
+    if (idbTimer) clearTimeout(idbTimer);
+    idbTimer = setTimeout(() => {
+      idbTimer = null;
+      if (!cancelled) persistIdbNow();
+    }, 1200);
+  };
+
+  const emitSorted = (shouldPersist = false) => {
+    hasEmittedOnce = true;
+    const { active, deleted } = getPartitionedItems();
+    onData(active);
+    onDeletedData?.(deleted);
+    if (shouldPersist && fullSyncDone) {
+      schedulePersistIdb();
+    }
+  };
+
+  const scheduleEmitSorted = (shouldPersist = false) => {
+    if (!hasEmittedOnce) {
+      emitSorted(shouldPersist);
+      return;
+    }
+    if (emitTimer) clearTimeout(emitTimer);
+    emitTimer = setTimeout(() => {
+      emitTimer = null;
+      if (!cancelled) emitSorted(shouldPersist);
+    }, 90);
+  };
+
+  const attachDeltaListener = (sinceIso: string) => {
+    if (cancelled) return;
+    if (unsubDelta) {
+      unsubDelta();
+      unsubDelta = null;
+    }
+    const q = sinceIso
+      ? query(collection(db, 'books'), where('updatedAt', '>', sinceIso))
+      : query(collection(db, 'books'));
+
+    unsubDelta = onSnapshot(
+      q,
+      (snap) => {
+        if (cancelled) return;
+        if (snap.empty && sinceIso) {
+          if (!hasEmittedOnce) emitSorted(false);
+          return;
+        }
+        let changed = false;
+        const changes = snap.docChanges();
+        changes.forEach((change) => {
+          const normalized = normalizeBookDoc(
+            change.doc.id,
+            change.doc.data() as Record<string, unknown>
+          );
+          if (normalized.updatedAt > maxUpdatedAt) {
+            maxUpdatedAt = normalized.updatedAt;
+          }
+          if (change.type === 'removed') {
+            knownDocIds.delete(change.doc.id);
+            deletedDocIds.delete(change.doc.id);
+            if (bookMap.delete(change.doc.id)) changed = true;
+          } else {
+            knownDocIds.add(change.doc.id);
+            if (isAllowedFirestoreBook(change.doc.id, normalized, bundledMap)) {
+              if (normalized.isDeleted) {
+                deletedDocIds.add(change.doc.id);
+              } else {
+                deletedDocIds.delete(change.doc.id);
+              }
+              bookMap.set(change.doc.id, normalized);
+              changed = true;
+            } else {
+              bookMap.delete(change.doc.id);
+            }
+          }
+        });
+        if (!sinceIso) {
+          fullSyncDone = true;
+          emitSorted(true);
+        } else if (changed) {
+          if (changes.length > 5) {
+            scheduleEmitSorted(true);
+          } else {
+            emitSorted(true);
+          }
+        }
+      },
+      (err) => {
+        if (!cancelled) onError(err);
+      }
+    );
+  };
+
+  const runFullFetchAndListen = async () => {
+    const snap = await getDocs(collection(db, 'books'));
+    if (cancelled) return;
+    bookMap.clear();
+    knownDocIds.clear();
+    deletedDocIds.clear();
+    maxUpdatedAt = '';
+    snap.forEach((d) => {
+      knownDocIds.add(d.id);
+      const normalized = normalizeBookDoc(d.id, d.data() as Record<string, unknown>);
+      if (normalized.updatedAt > maxUpdatedAt) {
+        maxUpdatedAt = normalized.updatedAt;
+      }
+      if (isAllowedFirestoreBook(d.id, normalized, bundledMap)) {
+        if (normalized.isDeleted) {
+          deletedDocIds.add(d.id);
+        }
+        bookMap.set(d.id, normalized);
+      }
+    });
+    fullSyncDone = true;
+    emitSorted(true);
+    attachDeltaListener(maxUpdatedAt);
+  };
+
+  void (async () => {
+    try {
+      const [loadedBundled, idbCache] = await Promise.all([
+        loadBundledCatalog(),
+        loadCatalogCacheFromIdb(),
+      ]);
+      if (cancelled) return;
+      bundledMap = loadedBundled;
+
+      if (idbCache && (idbCache.books.length > 0 || idbCache.knownDocIds.length > 0)) {
+        for (const rawBook of idbCache.books) {
+          const b = normalizeBookDoc(rawBook.id, rawBook as unknown as Record<string, unknown>);
+          if (!isAllowedFirestoreBook(b.id, b, bundledMap)) continue;
+          if (
+            bundledMap.has(b.id) &&
+            idbCache.books.length > 15000 &&
+            !b.isDeleted &&
+            b.isActive &&
+            (b.borrowCount || 0) === 0 &&
+            getBookAvailableCount(b) === Math.max(1, b.quantity || 1)
+          ) {
+            continue;
+          }
+          if (b.isDeleted) {
+            deletedDocIds.add(b.id);
+          }
+          bookMap.set(b.id, b);
+        }
+        for (const id of idbCache.knownDocIds) {
+          knownDocIds.add(id);
+        }
+        for (const id of idbCache.deletedIds || []) {
+          if (bundledMap.has(id) || bookMap.has(id)) {
+            deletedDocIds.add(id);
+          }
+        }
+        maxUpdatedAt = idbCache.maxUpdatedAt || '';
+        fullSyncDone = Boolean(idbCache.fullSyncDone);
+        emitSorted(false);
+      } else if (initialCachedBooks.length > 0) {
+        for (const rawBook of initialCachedBooks) {
+          const b = normalizeBookDoc(rawBook.id, rawBook as unknown as Record<string, unknown>);
+          if (!isAllowedFirestoreBook(b.id, b, bundledMap)) continue;
+          bookMap.set(b.id, b);
+          knownDocIds.add(b.id);
+          if (b.updatedAt > maxUpdatedAt) maxUpdatedAt = b.updatedAt;
+        }
+        emitSorted(false);
+      } else if (bundledMap.size > 0) {
+        emitSorted(false);
+      }
+
+      const countSnap = await getCountFromServer(collection(db, 'books'));
+      if (cancelled) return;
+      const serverCount = countSnap.data().count;
+
+      if (
+        fullSyncDone &&
+        maxUpdatedAt &&
+        knownDocIds.size === serverCount
+      ) {
+        attachDeltaListener(maxUpdatedAt);
+      } else {
+        await runFullFetchAndListen();
+      }
+    } catch (err) {
+      if (cancelled) return;
+      if (bundledMap.size > 0 || bookMap.size > 0) {
+        emitSorted(false);
+      }
+      if (bookMap.size > 0 && maxUpdatedAt) {
+        attachDeltaListener(maxUpdatedAt);
+      }
+      onError(err instanceof Error ? err : new Error(String(err)));
+    }
+  })();
+
+  return () => {
+    cancelled = true;
+    if (emitTimer) clearTimeout(emitTimer);
+    if (idbTimer) clearTimeout(idbTimer);
+    if (unsubDelta) unsubDelta();
+  };
+}
+
+const TX_RECENT_LIMIT = 3000;
+const TX_ACTIVE_LIMIT = 3000;
+
 export function subscribeTransactions(
-  onData: (items: TransactionRecord[]) => void,
+  onData: (items: TransactionRecord[], meta?: { isTruncated: boolean }) => void,
   onError: (err: Error) => void
 ): Unsubscribe {
-  const q = query(collection(db, 'transactions'), orderBy('createdAt', 'desc'));
-  return onSnapshot(
-    q,
+  const recentMap = new Map<string, TransactionRecord>();
+  const activeMap = new Map<string, TransactionRecord>();
+  let recentReady = false;
+  let activeReady = false;
+  let recentCount = 0;
+
+  const emitMerged = () => {
+    if (!recentReady && !activeReady) return;
+    const merged = new Map<string, TransactionRecord>();
+    recentMap.forEach((v, k) => merged.set(k, v));
+    activeMap.forEach((v, k) => merged.set(k, v));
+    const list = Array.from(merged.values());
+    list.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+    onData(list, { isTruncated: recentCount >= TX_RECENT_LIMIT });
+  };
+
+  const recentQ = query(
+    collection(db, 'transactions'),
+    orderBy('createdAt', 'desc'),
+    limit(TX_RECENT_LIMIT)
+  );
+  const activeQ = query(
+    collection(db, 'transactions'),
+    where('status', '==', 'active'),
+    limit(TX_ACTIVE_LIMIT)
+  );
+
+  const unsubRecent = onSnapshot(
+    recentQ,
     (snap) => {
-      const items: TransactionRecord[] = [];
+      recentMap.clear();
+      recentCount = snap.size;
       snap.forEach((d) => {
-        items.push({ id: d.id, ...(d.data() as Omit<TransactionRecord, 'id'>) });
+        recentMap.set(d.id, { id: d.id, ...(d.data() as Omit<TransactionRecord, 'id'>) });
       });
-      onData(items);
+      recentReady = true;
+      emitMerged();
     },
     (err) => onError(err)
   );
+
+  const unsubActive = onSnapshot(
+    activeQ,
+    (snap) => {
+      activeMap.clear();
+      snap.forEach((d) => {
+        activeMap.set(d.id, { id: d.id, ...(d.data() as Omit<TransactionRecord, 'id'>) });
+      });
+      activeReady = true;
+      emitMerged();
+    },
+    (err) => onError(err)
+  );
+
+  return () => {
+    unsubRecent();
+    unsubActive();
+  };
 }
 
 export function subscribeStudents(
   onData: (items: Student[]) => void,
   onError: (err: Error) => void
 ): Unsubscribe {
-  const q = query(collection(db, 'students'), orderBy('updatedAt', 'desc'));
+  const q = query(collection(db, 'students'), orderBy('updatedAt', 'desc'), limit(2500));
   return onSnapshot(
     q,
     (snap) => {
@@ -376,8 +800,9 @@ export function subscribeSignatures(
   onData: (items: Record<string, SignatureRecord>) => void,
   onError: (err: Error) => void
 ): Unsubscribe {
+  const q = query(collection(db, 'signatures'), orderBy('createdAt', 'desc'), limit(300));
   return onSnapshot(
-    collection(db, 'signatures'),
+    q,
     (snap) => {
       const map: Record<string, SignatureRecord> = {};
       snap.forEach((d) => {
@@ -389,11 +814,33 @@ export function subscribeSignatures(
   );
 }
 
+export async function getSignatureById(signatureId: string): Promise<SignatureRecord | null> {
+  if (!signatureId) return null;
+  const snap = await getDoc(doc(db, 'signatures', signatureId));
+  if (!snap.exists()) return null;
+  return { id: snap.id, ...(snap.data() as Omit<SignatureRecord, 'id'>) };
+}
+
+export async function fetchSignaturesByStudentId(
+  studentId: string
+): Promise<SignatureRecord[]> {
+  if (!studentId) return [];
+  const snap = await getDocs(
+    query(collection(db, 'signatures'), where('studentId', '==', studentId), limit(100))
+  );
+  const items: SignatureRecord[] = [];
+  snap.forEach((d) => {
+    items.push({ id: d.id, ...(d.data() as Omit<SignatureRecord, 'id'>) });
+  });
+  items.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+  return items;
+}
+
 export function subscribeActivityLogs(
   onData: (items: ActivityLogRecord[]) => void,
   onError: (err: Error) => void
 ): Unsubscribe {
-  const q = query(collection(db, 'activityLogs'), orderBy('createdAt', 'desc'));
+  const q = query(collection(db, 'activityLogs'), orderBy('createdAt', 'desc'), limit(200));
   return onSnapshot(
     q,
     (snap) => {
@@ -473,7 +920,16 @@ export async function deleteQrUploadSession(sessionId: string): Promise<void> {
   }
 }
 
-// Face ID Profile Lookups & Admin Reset (Scalable targeted queries; never loads full collection)
+const faceLookupCache = new Map<
+  string,
+  { ts: number; result: { exactMatch: FaceProfile | null; candidates: FaceProfile[] } }
+>();
+
+export function clearFaceLookupCache(): void {
+  faceLookupCache.clear();
+}
+
+// Face ID Profile Lookups & Admin Reset (Scalable targeted queries with session caching)
 export async function lookupFaceProfilesByName(
   firstName: string,
   lastName: string,
@@ -490,6 +946,11 @@ export async function lookupFaceProfilesByName(
 
   const nameKey = makeFaceNameKey(f, l);
   const groupKey = group ? normalizeGroupCompare(group) : '';
+  const cacheKey = `${nameKey}::${groupKey}`;
+  const cached = faceLookupCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < 5 * 60 * 1000) {
+    return cached.result;
+  }
 
   // Fast direct doc lookup first when group is known
   if (groupKey) {
@@ -497,7 +958,9 @@ export async function lookupFaceProfilesByName(
     const directSnap = await getDoc(doc(db, 'faceProfiles', directId));
     if (directSnap.exists()) {
       const profile = { id: directSnap.id, ...(directSnap.data() as Omit<FaceProfile, 'id'>) };
-      return { exactMatch: profile, candidates: [profile] };
+      const result = { exactMatch: profile, candidates: [profile] };
+      faceLookupCache.set(cacheKey, { ts: Date.now(), result });
+      return result;
     }
   }
 
@@ -511,21 +974,23 @@ export async function lookupFaceProfilesByName(
     candidates.push({ id: d.id, ...(d.data() as Omit<FaceProfile, 'id'>) });
   });
 
+  let result: { exactMatch: FaceProfile | null; candidates: FaceProfile[] };
   if (candidates.length === 0) {
-    return { exactMatch: null, candidates: [] };
-  }
-
-  if (groupKey) {
+    result = { exactMatch: null, candidates: [] };
+  } else if (groupKey) {
     const matchedByGroup = candidates.find(
       (c) => normalizeGroupCompare(c.group) === groupKey || c.groupKey === groupKey
     );
-    return { exactMatch: matchedByGroup || null, candidates };
+    result = { exactMatch: matchedByGroup || null, candidates };
+  } else {
+    result = {
+      exactMatch: candidates[0],
+      candidates,
+    };
   }
 
-  return {
-    exactMatch: candidates.length === 1 ? candidates[0] : candidates[0],
-    candidates,
-  };
+  faceLookupCache.set(cacheKey, { ts: Date.now(), result });
+  return result;
 }
 
 export async function getFaceProfileById(profileId: string): Promise<FaceProfile | null> {
@@ -541,6 +1006,7 @@ export async function deleteFaceProfileAdmin(
 ): Promise<void> {
   if (!profileId) return;
   await deleteDoc(doc(db, 'faceProfiles', profileId));
+  clearFaceLookupCache();
   logAdminActivityNonBlocking({
     action: 'O‘quvchi Face ID profili o‘chirildi',
     targetType: 'faceProfile',
@@ -548,6 +1014,15 @@ export async function deleteFaceProfileAdmin(
     targetLabel: studentLabel,
     details: 'Administrator Face ID rasmini qayta tushish uchun tozaladi.',
   });
+}
+
+function isStudentFieldMatch(a: string, b: string): boolean {
+  const na = normalizeCompareText(a);
+  const nb = normalizeCompareText(b);
+  if (na === nb) return true;
+  const ca = transliterateToLatinCanonical(a);
+  const cb = transliterateToLatinCanonical(b);
+  return Boolean(ca && ca === cb);
 }
 
 export async function resolveReturnFaceRequirement(params: {
@@ -558,6 +1033,7 @@ export async function resolveReturnFaceRequirement(params: {
 }): Promise<{
   borrowFound: boolean;
   requiresFaceVerification: boolean;
+  requiresExtraBookNumber: boolean;
   faceProfile: FaceProfile | null;
   borrowStudentName?: string;
 }> {
@@ -565,11 +1041,14 @@ export async function resolveReturnFaceRequirement(params: {
   const l = params.lastName.trim();
   const g = params.group.trim();
   if (!params.bookId || !f || !l || !g) {
-    return { borrowFound: false, requiresFaceVerification: false, faceProfile: null };
+    return {
+      borrowFound: false,
+      requiresFaceVerification: false,
+      requiresExtraBookNumber: false,
+      faceProfile: null,
+    };
   }
 
-  const normFirst = normalizeCompareText(f);
-  const normLast = normalizeCompareText(l);
   const normGroup = normalizeGroupCompare(g);
 
   const activeSnap = await getDocs(
@@ -585,8 +1064,8 @@ export async function resolveReturnFaceRequirement(params: {
     const data = d.data() as Omit<TransactionRecord, 'id'>;
     if (
       data.type === 'borrow' &&
-      normalizeCompareText(data.studentFirstName) === normFirst &&
-      normalizeCompareText(data.studentLastName) === normLast &&
+      isStudentFieldMatch(data.studentFirstName, f) &&
+      isStudentFieldMatch(data.studentLastName, l) &&
       normalizeGroupCompare(data.studentGroup) === normGroup
     ) {
       matched = { id: d.id, ...data };
@@ -594,7 +1073,12 @@ export async function resolveReturnFaceRequirement(params: {
   });
 
   if (!matched) {
-    return { borrowFound: false, requiresFaceVerification: false, faceProfile: null };
+    return {
+      borrowFound: false,
+      requiresFaceVerification: false,
+      requiresExtraBookNumber: false,
+      faceProfile: null,
+    };
   }
 
   const matchedTx = matched as TransactionRecord;
@@ -606,15 +1090,55 @@ export async function resolveReturnFaceRequirement(params: {
   return {
     borrowFound: true,
     requiresFaceVerification: Boolean(faceProfile),
+    requiresExtraBookNumber: Boolean((matchedTx.extraBookNumber || '').trim()),
     faceProfile,
     borrowStudentName: matchedTx.studentFullName,
   };
+}
+
+export interface ActiveBorrowBookSummary {
+  bookId: string;
+  count: number;
+  borrowers: Array<{
+    fullName: string;
+    group: string;
+    borrowedAt: string;
+  }>;
+}
+
+export async function fetchActiveBorrowSummaries(): Promise<Map<string, ActiveBorrowBookSummary>> {
+  const snap = await getDocs(
+    query(collection(db, 'transactions'), where('status', '==', 'active'), limit(3000))
+  );
+  const map = new Map<string, ActiveBorrowBookSummary>();
+  snap.forEach((d) => {
+    const data = d.data() as Omit<TransactionRecord, 'id'>;
+    if (data.type !== 'borrow' || !data.bookId) return;
+    const existing = map.get(data.bookId);
+    const borrower = {
+      fullName: data.studentFullName || '',
+      group: data.studentGroup || '',
+      borrowedAt: data.borrowedAt || '',
+    };
+    if (existing) {
+      existing.count += 1;
+      existing.borrowers.push(borrower);
+    } else {
+      map.set(data.bookId, {
+        bookId: data.bookId,
+        count: 1,
+        borrowers: [borrower],
+      });
+    }
+  });
+  return map;
 }
 
 // Multi-copy atomic borrow
 export async function borrowBookAtomic(params: {
   bookId: string;
   bookNumber: string;
+  extraBookNumber?: string;
   firstName: string;
   lastName: string;
   group: string;
@@ -667,6 +1191,8 @@ export async function borrowBookAtomic(params: {
   const txRef = doc(db, 'transactions', transactionId);
   const sigRef = doc(db, 'signatures', signatureId);
 
+  const bundledBookFallback = await getBundledBookById(params.bookId);
+
   let finalFaceProfileId: string | undefined = params.existingFaceProfileId;
 
   await runTransaction(db, async (tx) => {
@@ -675,10 +1201,14 @@ export async function borrowBookAtomic(params: {
       tx.get(studentRef),
       tx.get(faceRef),
     ]);
-    if (!bookSnap.exists()) {
+    const bookExistsInFirestore = bookSnap.exists();
+    const book: Omit<Book, 'id'> | null = bookExistsInFirestore
+      ? (bookSnap.data() as Omit<Book, 'id'>)
+      : bundledBookFallback;
+
+    if (!book) {
       throw new Error('Tanlangan kitob tizimda topilmadi.');
     }
-    const book = bookSnap.data() as Omit<Book, 'id'>;
     if (book.isDeleted || !book.isActive) {
       throw new Error('Bu kitob hozirda faol katalogda emas.');
     }
@@ -743,18 +1273,39 @@ export async function borrowBookAtomic(params: {
     }
 
     const nextAvail = avail - 1;
-    tx.update(bookRef, {
-      availableQuantity: nextAvail,
-      status: nextAvail <= 0 ? 'olingan' : 'mavjud',
-      currentTransactionId: transactionId,
-      currentBorrowerName: fullName,
-      currentBorrowerGroup: group,
-      currentBorrowerCourse: course,
-      currentBorrowedAt: borrowedAt,
-      currentDueDate: params.dueDateIso,
-      borrowCount: (book.borrowCount || 0) + 1,
-      updatedAt: now,
-    });
+    if (bookExistsInFirestore) {
+      tx.update(bookRef, {
+        availableQuantity: nextAvail,
+        status: nextAvail <= 0 ? 'olingan' : 'mavjud',
+        currentTransactionId: transactionId,
+        currentBorrowerName: fullName,
+        currentBorrowerGroup: group,
+        currentBorrowerCourse: course,
+        currentBorrowedAt: borrowedAt,
+        currentDueDate: params.dueDateIso,
+        borrowCount: (book.borrowCount || 0) + 1,
+        updatedAt: now,
+      });
+    } else {
+      tx.set(
+        bookRef,
+        sanitizeBookForFirestore({
+          ...book,
+          availableQuantity: nextAvail,
+          status: nextAvail <= 0 ? 'olingan' : 'mavjud',
+          currentTransactionId: transactionId,
+          currentBorrowerName: fullName,
+          currentBorrowerGroup: group,
+          currentBorrowerCourse: course,
+          currentBorrowedAt: borrowedAt,
+          currentDueDate: params.dueDateIso,
+          borrowCount: (book.borrowCount || 0) + 1,
+          updatedAt: now,
+        })
+      );
+    }
+
+    const extraBookNumberClean = (params.extraBookNumber || '').trim().slice(0, 64);
 
     const txRecord: Omit<TransactionRecord, 'id'> = {
       bookId: params.bookId,
@@ -772,6 +1323,7 @@ export async function borrowBookAtomic(params: {
       dueDate: params.dueDateIso,
       borrowSignatureId: signatureId,
       ...(finalFaceProfileId ? { faceProfileId: finalFaceProfileId } : {}),
+      ...(extraBookNumberClean ? { extraBookNumber: extraBookNumberClean } : {}),
       createdAt: now,
     };
     tx.set(txRef, txRecord);
@@ -789,6 +1341,7 @@ export async function borrowBookAtomic(params: {
     tx.set(sigRef, sigRecord);
   });
 
+  clearFaceLookupCache();
   return { transactionId, borrowedAt, dueDate: params.dueDateIso, faceProfileId: finalFaceProfileId };
 }
 
@@ -796,6 +1349,7 @@ export async function borrowBookAtomic(params: {
 export async function borrowNewUnlistedBookAtomic(params: {
   title: string;
   bookNumber?: string;
+  extraBookNumber?: string;
   author?: string;
   category?: string;
   quantity?: number;
@@ -870,6 +1424,7 @@ export async function borrowNewUnlistedBookAtomic(params: {
     const res = await borrowBookAtomic({
       bookId: matchedExisting.id,
       bookNumber: matchedExisting.bookNumber,
+      extraBookNumber: params.extraBookNumber,
       firstName,
       lastName,
       group,
@@ -961,13 +1516,13 @@ export async function borrowNewUnlistedBookAtomic(params: {
       tx.set(faceRef, newFace);
     }
 
-    const newBook: Omit<Book, 'id'> = {
+    const newBook = sanitizeBookForFirestore({
       bookNumber: finalBookNumber,
       title,
       author: (params.author || '').trim(),
       category: (params.category || '').trim() || 'Umumiy',
       description: 'O‘quvchi tomonidan «Yangi kitob olish» orqali katalogga kiritilgan kitob.',
-      coverUrl: params.coverUrl,
+      coverUrl: (params.coverUrl || '').trim() || DEFAULT_BOOK_COVER_URL,
       quantity: qty,
       availableQuantity: nextAvail,
       status: nextAvail <= 0 ? 'olingan' : 'mavjud',
@@ -982,7 +1537,7 @@ export async function borrowNewUnlistedBookAtomic(params: {
       borrowCount: 1,
       createdAt: now,
       updatedAt: now,
-    };
+    });
     tx.set(bookRef, newBook);
 
     if (studentSnap.exists()) {
@@ -1013,6 +1568,8 @@ export async function borrowNewUnlistedBookAtomic(params: {
       tx.set(studentRef, newStudent);
     }
 
+    const extraBookNumberClean = (params.extraBookNumber || '').trim().slice(0, 64);
+
     const txRecord: Omit<TransactionRecord, 'id'> = {
       bookId,
       bookNumber: finalBookNumber,
@@ -1029,6 +1586,7 @@ export async function borrowNewUnlistedBookAtomic(params: {
       dueDate: params.dueDateIso,
       borrowSignatureId: signatureId,
       ...(finalFaceProfileId ? { faceProfileId: finalFaceProfileId } : {}),
+      ...(extraBookNumberClean ? { extraBookNumber: extraBookNumberClean } : {}),
       createdAt: now,
     };
     tx.set(txRef, txRecord);
@@ -1046,6 +1604,7 @@ export async function borrowNewUnlistedBookAtomic(params: {
     tx.set(sigRef, sigRecord);
   });
 
+  clearFaceLookupCache();
   return {
     bookId,
     bookNumber: finalBookNumber,
@@ -1059,6 +1618,7 @@ export async function borrowNewUnlistedBookAtomic(params: {
 export async function returnBookAtomic(params: {
   bookId: string;
   bookNumber: string;
+  extraBookNumber?: string;
   bookTitle?: string;
   firstName: string;
   lastName: string;
@@ -1082,8 +1642,6 @@ export async function returnBookAtomic(params: {
     throw new Error('Topshirish uchun elektron imzo qo‘yilishi shart.');
   }
 
-  const normFirst = normalizeCompareText(firstName);
-  const normLast = normalizeCompareText(lastName);
   const normGroup = normalizeGroupCompare(group);
   const normBookNumber = normalizeCompareText(params.bookNumber);
   const normBookTitle = params.bookTitle ? normalizeCompareText(params.bookTitle) : '';
@@ -1096,8 +1654,8 @@ export async function returnBookAtomic(params: {
     >
   ): boolean => {
     return (
-      normalizeCompareText(t.studentFirstName) === normFirst &&
-      normalizeCompareText(t.studentLastName) === normLast &&
+      isStudentFieldMatch(t.studentFirstName, firstName) &&
+      isStudentFieldMatch(t.studentLastName, lastName) &&
       normalizeGroupCompare(t.studentGroup) === normGroup
     );
   };
@@ -1144,14 +1702,23 @@ export async function returnBookAtomic(params: {
         `Kitob inventar raqami mos kelmadi. Kiritilgan: ${params.bookNumber}, tizimda: ${book.bookNumber}.`
       );
     }
-    if (
-      !params.adminOverride &&
-      normBookTitle &&
-      !normalizeCompareText(book.title).includes(normBookTitle)
-    ) {
-      throw new Error(
-        `Kitob nomi mos kelmadi. Kiritilgan: «${params.bookTitle}». Kitob qabul qilinmadi.`
-      );
+    if (!params.adminOverride && normBookTitle) {
+      const dbNormTitle = normalizeCompareText(book.title);
+      const dbCanonTitle = transliterateToLatinCanonical(book.title);
+      const inCanonTitle = transliterateToLatinCanonical(params.bookTitle || '');
+      const dbRelTitle = toRelaxedPhonetic(dbCanonTitle);
+      const inRelTitle = toRelaxedPhonetic(inCanonTitle);
+
+      const titleMatches =
+        dbNormTitle.includes(normBookTitle) ||
+        (inCanonTitle.length > 0 && dbCanonTitle.includes(inCanonTitle)) ||
+        (inRelTitle.length > 0 && dbRelTitle.includes(inRelTitle));
+
+      if (!titleMatches) {
+        throw new Error(
+          `Kitob nomi mos kelmadi. Kiritilgan: «${params.bookTitle}». Kitob qabul qilinmadi.`
+        );
+      }
     }
 
     const currentAvail = getBookAvailableCount(book);
@@ -1198,8 +1765,8 @@ export async function returnBookAtomic(params: {
         let bestScore = -1;
         for (const b of poolToCompare) {
           let score = 0;
-          if (normalizeCompareText(b.studentFirstName) === normFirst) score++;
-          if (normalizeCompareText(b.studentLastName) === normLast) score++;
+          if (isStudentFieldMatch(b.studentFirstName, firstName)) score++;
+          if (isStudentFieldMatch(b.studentLastName, lastName)) score++;
           if (normalizeGroupCompare(b.studentGroup) === normGroup) score++;
           if (score > bestScore) {
             bestScore = score;
@@ -1209,10 +1776,10 @@ export async function returnBookAtomic(params: {
 
         const mismatchedFields: string[] = [];
         if (closest) {
-          if (normalizeCompareText(closest.studentFirstName) !== normFirst) {
+          if (!isStudentFieldMatch(closest.studentFirstName, firstName)) {
             mismatchedFields.push('Ism');
           }
-          if (normalizeCompareText(closest.studentLastName) !== normLast) {
+          if (!isStudentFieldMatch(closest.studentLastName, lastName)) {
             mismatchedFields.push('Familiya');
           }
           if (normalizeGroupCompare(closest.studentGroup) !== normGroup) {
@@ -1228,6 +1795,25 @@ export async function returnBookAtomic(params: {
         throw new Error(
           `Kiritilgan ma’lumotlar mos kelmadi${detailText}. Kitob qabul qilinmadi — kitobni olgandagi ism, familiya va guruhni to‘g‘ri kiriting.`
         );
+      }
+
+      const expectedExtra = (exactMatch.extraBookNumber || '').trim();
+      if (expectedExtra) {
+        const enteredExtra = (params.extraBookNumber || '').trim();
+        if (!enteredExtra) {
+          throw new Error(
+            'Ushbu kitobni olayotganda qo‘shimcha kitob raqami kiritilgan. Topshirish uchun o‘sha qo‘shimcha raqamni kiritish majburiy!'
+          );
+        }
+        const directEq = normalizeCompareText(enteredExtra) === normalizeCompareText(expectedExtra);
+        const canonExpected = transliterateToLatinCanonical(expectedExtra);
+        const canonEntered = transliterateToLatinCanonical(enteredExtra);
+        const canonEq = Boolean(canonExpected && canonEntered === canonExpected);
+        if (!directEq && !canonEq) {
+          throw new Error(
+            'Kiritilgan qo‘shimcha kitob raqami kitobni olgandagi raqam bilan mos kelmadi. To‘g‘ri qo‘shimcha raqamni kiriting.'
+          );
+        }
       }
     }
 
@@ -1318,6 +1904,14 @@ export async function returnBookAtomic(params: {
       updatedAt: now,
     });
 
+    const finalExtraBookNumber = (
+      params.extraBookNumber ||
+      activeBorrowTx?.extraBookNumber ||
+      ''
+    )
+      .trim()
+      .slice(0, 64);
+
     const returnRecord: Omit<TransactionRecord, 'id'> = {
       bookId: params.bookId,
       bookNumber: book.bookNumber,
@@ -1335,6 +1929,7 @@ export async function returnBookAtomic(params: {
       returnedAt,
       returnSignatureId: signatureId,
       ...(targetFaceSnap.exists() ? { faceProfileId: targetFaceProfileId } : {}),
+      ...(finalExtraBookNumber ? { extraBookNumber: finalExtraBookNumber } : {}),
       adminOverride: Boolean(params.adminOverride),
       createdAt: now,
     };
@@ -1458,6 +2053,7 @@ export async function adminReturnTransactionAtomic(params: {
       dueDate: src.dueDate,
       returnedAt,
       borrowSignatureId: src.borrowSignatureId,
+      ...(src.extraBookNumber ? { extraBookNumber: src.extraBookNumber } : {}),
       adminOverride: true,
       createdAt: now,
     };
@@ -1501,14 +2097,17 @@ export function enqueueOfflineAction(action: OfflinePendingAction): OfflinePendi
 export async function flushOfflineQueue(): Promise<{
   syncedCount: number;
   remaining: OfflinePendingAction[];
+  quotaExceeded?: boolean;
 }> {
   const queue = loadOfflineQueue();
-  if (queue.length === 0) return { syncedCount: 0, remaining: [] };
+  if (queue.length === 0) return { syncedCount: 0, remaining: [], quotaExceeded: false };
 
   let syncedCount = 0;
+  let quotaExceeded = false;
   const remaining: OfflinePendingAction[] = [];
 
-  for (const item of queue) {
+  for (let i = 0; i < queue.length; i++) {
+    const item = queue[i];
     try {
       if (item.kind === 'borrow') {
         const faceEnrollment =
@@ -1522,6 +2121,7 @@ export async function flushOfflineQueue(): Promise<{
         await borrowBookAtomic({
           bookId: item.payload.bookId,
           bookNumber: item.payload.bookNumber,
+          extraBookNumber: item.payload.extraBookNumber,
           firstName: item.payload.firstName,
           lastName: item.payload.lastName,
           group: item.payload.group,
@@ -1543,6 +2143,7 @@ export async function flushOfflineQueue(): Promise<{
         await borrowNewUnlistedBookAtomic({
           title: item.payload.bookTitle,
           bookNumber: item.payload.bookNumber,
+          extraBookNumber: item.payload.extraBookNumber,
           author: item.payload.author,
           category: item.payload.category,
           quantity: item.payload.quantity,
@@ -1560,6 +2161,7 @@ export async function flushOfflineQueue(): Promise<{
         await returnBookAtomic({
           bookId: item.payload.bookId,
           bookNumber: item.payload.bookNumber,
+          extraBookNumber: item.payload.extraBookNumber,
           bookTitle: item.payload.bookTitle,
           firstName: item.payload.firstName,
           lastName: item.payload.lastName,
@@ -1573,22 +2175,27 @@ export async function flushOfflineQueue(): Promise<{
       }
       syncedCount++;
     } catch (err) {
+      if (isQuotaExceededError(err)) {
+        quotaExceeded = true;
+        remaining.push(...queue.slice(i));
+        break;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       remaining.push({ ...item, lastError: msg });
     }
   }
 
   saveOfflineQueue(remaining);
-  return { syncedCount, remaining };
+  return { syncedCount, remaining, quotaExceeded };
 }
 
 // Admin Authentication & Settings
-export async function verifyAdminPassword(password: string): Promise<{
-  valid: boolean;
-  mustChangePassword: boolean;
-}> {
-  let cred = adminCredCache;
-  if (!cred) {
+async function fetchLatestAdminCredential(): Promise<AdminCredential> {
+  if (!navigator.onLine && adminCredCache) {
+    return adminCredCache;
+  }
+
+  try {
     const snap = await getDoc(doc(db, 'admins', 'primary'));
     const data = snap.exists() ? (snap.data() as AdminCredential) : null;
     if (!data || data.algorithm !== 'PBKDF2-SHA256-SHARED') {
@@ -1597,14 +2204,29 @@ export async function verifyAdminPassword(password: string): Promise<{
       if (!seededSnap.exists()) {
         throw new Error('Administrator ma’lumotlari topilmadi.');
       }
-      cred = seededSnap.data() as AdminCredential;
-    } else {
-      cred = data;
+      const seeded = seededSnap.data() as AdminCredential;
+      adminCredCache = seeded;
+      writeCachedCredential(ADMIN_CRED_CACHE_KEY, seeded);
+      return seeded;
     }
-    adminCredCache = cred;
+    adminCredCache = data;
+    writeCachedCredential(ADMIN_CRED_CACHE_KEY, data);
+    return data;
+  } catch (err) {
+    if (adminCredCache) return adminCredCache;
+    throw err;
   }
+}
 
-  const valid = await verifyPassword(password, cred.salt, cred.passwordHash, cred.iterations);
+export async function verifyAdminPassword(password: string): Promise<{
+  valid: boolean;
+  mustChangePassword: boolean;
+}> {
+  const cred = await fetchLatestAdminCredential();
+  let valid = await verifyPassword(password, cred.salt, cred.passwordHash, cred.iterations);
+  if (!valid && password !== password.trim()) {
+    valid = await verifyPassword(password.trim(), cred.salt, cred.passwordHash, cred.iterations);
+  }
   if (valid) {
     logAdminActivityNonBlocking({
       action: 'Admin tizimga kirdi',
@@ -1621,22 +2243,27 @@ export async function changeAdminPassword(
   currentPassword: string,
   newPassword: string
 ): Promise<void> {
-  if (newPassword.trim().length < 5) {
-    throw new Error('Yangi parol kamida 5 ta belgidan iborat bo‘lishi kerak.');
+  const trimmedNew = newPassword.trim();
+  const trimmedCurrent = currentPassword.trim();
+  if (trimmedNew.length < 4) {
+    throw new Error('Yangi parol kamida 4 ta belgidan iborat bo‘lishi kerak.');
   }
-  const snap = await getDoc(doc(db, 'admins', 'primary'));
-  if (!snap.exists()) {
-    throw new Error('Administrator hisobi topilmadi.');
+  if (trimmedNew === trimmedCurrent) {
+    throw new Error('Yangi parol eski paroldan farq qilishi kerak.');
   }
-  const cred = snap.data() as AdminCredential;
-  const valid = await verifyPassword(currentPassword, cred.salt, cred.passwordHash, cred.iterations);
+
+  const cred = await fetchLatestAdminCredential();
+  let valid = await verifyPassword(currentPassword, cred.salt, cred.passwordHash, cred.iterations);
+  if (!valid && currentPassword !== trimmedCurrent) {
+    valid = await verifyPassword(trimmedCurrent, cred.salt, cred.passwordHash, cred.iterations);
+  }
   if (!valid) {
-    throw new Error('Joriy parol noto‘g‘ri kiritildi.');
+    throw new Error('Eski parol noto‘g‘ri kiritildi.');
   }
 
   const salt = generateSalt();
   const iterations = 100000;
-  const passwordHash = await hashPassword(newPassword, salt, iterations);
+  const passwordHash = await hashPassword(trimmedNew, salt, iterations);
   const updatedAt = new Date().toISOString();
 
   await updateDoc(doc(db, 'admins', 'primary'), {
@@ -1657,6 +2284,7 @@ export async function changeAdminPassword(
     mustChangePassword: false,
     updatedAt,
   };
+  writeCachedCredential(ADMIN_CRED_CACHE_KEY, adminCredCache);
 
   logAdminActivityNonBlocking({
     action: 'Admin paroli o‘zgartirildi',
@@ -1672,9 +2300,17 @@ export async function verifyAppGatePassword(password: string): Promise<boolean> 
   const trimmed = password.trim();
   if (!trimmed) return false;
   try {
-    const cred = await ensureAppGateCredential();
+    const cred = await ensureAppGateCredential(navigator.onLine);
     return verifyPassword(trimmed, cred.salt, cred.passwordHash, cred.iterations);
   } catch {
+    if (appGateCredCache) {
+      return verifyPassword(
+        trimmed,
+        appGateCredCache.salt,
+        appGateCredCache.passwordHash,
+        appGateCredCache.iterations
+      );
+    }
     if (!offlineAppGateHashPromise) {
       offlineAppGateHashPromise = hashPassword(
         'kutubxona',
@@ -1696,23 +2332,28 @@ export async function changeAppGatePassword(
   currentPassword: string,
   newPassword: string
 ): Promise<void> {
-  if (newPassword.trim().length < 4) {
+  const trimmedNew = newPassword.trim();
+  const trimmedCurrent = currentPassword.trim();
+  if (trimmedNew.length < 4) {
     throw new Error('Yangi kirish paroli kamida 4 ta belgidan iborat bo‘lishi kerak.');
   }
-  const cred = await ensureAppGateCredential();
+  if (trimmedNew === trimmedCurrent) {
+    throw new Error('Yangi parol eski paroldan farq qilishi kerak.');
+  }
+  const cred = await ensureAppGateCredential(true);
   const valid = await verifyPassword(
-    currentPassword.trim(),
+    trimmedCurrent,
     cred.salt,
     cred.passwordHash,
     cred.iterations
   );
   if (!valid) {
-    throw new Error('Joriy ilova kirish paroli noto‘g‘ri.');
+    throw new Error('Eski ilova kirish paroli noto‘g‘ri.');
   }
 
   const salt = generateSalt();
   const iterations = 100000;
-  const passwordHash = await hashPassword(newPassword.trim(), salt, iterations);
+  const passwordHash = await hashPassword(trimmedNew, salt, iterations);
   const updatedAt = new Date().toISOString();
 
   await updateDoc(doc(db, 'admins', 'app_gate'), {
@@ -1733,6 +2374,7 @@ export async function changeAppGatePassword(
     mustChangePassword: false,
     updatedAt,
   };
+  writeCachedCredential(APP_GATE_CRED_CACHE_KEY, appGateCredCache);
 
   logAdminActivityNonBlocking({
     action: 'Ilovaga kirish paroli o‘zgartirildi',
@@ -1785,13 +2427,14 @@ export async function createBookAdmin(params: {
   const now = new Date().toISOString();
   const bookId = makeSafeDocId('book');
   const qty = Math.max(1, Number(params.quantity) || 1);
-  const newBook: Omit<Book, 'id'> = {
+  const effectiveCoverUrl = (params.coverUrl || '').trim() || DEFAULT_BOOK_COVER_URL;
+  const newBook = sanitizeBookForFirestore({
     bookNumber,
     title,
     author: params.author.trim(),
     category: params.category.trim() || 'Umumiy',
     description: params.description.trim(),
-    coverUrl: params.coverUrl,
+    coverUrl: effectiveCoverUrl,
     quantity: qty,
     availableQuantity: qty,
     status: 'mavjud',
@@ -1800,7 +2443,7 @@ export async function createBookAdmin(params: {
     borrowCount: 0,
     createdAt: now,
     updatedAt: now,
-  };
+  });
 
   await setDoc(doc(db, 'books', bookId), newBook);
   logAdminActivityNonBlocking({
@@ -1811,6 +2454,152 @@ export async function createBookAdmin(params: {
     details: `Muallif: ${newBook.author || 'Ko‘rsatilmagan'}, Soni: ${newBook.quantity}`,
   });
   return bookId;
+}
+
+export async function importBooksBatchAdmin(params: {
+  rows: ParsedExcelBookRow[];
+  existingBooks: Book[];
+  duplicateStrategy: 'auto-number' | 'skip';
+  onProgress?: (done: number, total: number) => void;
+}): Promise<{
+  importedCount: number;
+  skippedCount: number;
+  totalCopies: number;
+}> {
+  const usedNumbers = new Set<string>();
+  let maxNum = 0;
+
+  for (const b of params.existingBooks) {
+    if (b.isDeleted) continue;
+    const numLower = (b.bookNumber || '').trim().toLowerCase();
+    if (numLower) usedNumbers.add(numLower);
+    const parsed = parseInt((b.bookNumber || '').replace(/\D/g, ''), 10);
+    if (!Number.isNaN(parsed) && parsed > maxNum) maxNum = parsed;
+  }
+
+  const nextFreeNumber = (): string => {
+    let candidate = '';
+    do {
+      maxNum += 1;
+      candidate = String(maxNum).padStart(3, '0');
+    } while (usedNumbers.has(candidate.toLowerCase()));
+    usedNumbers.add(candidate.toLowerCase());
+    return candidate;
+  };
+
+  const toInsert: Array<{ id: string; data: Omit<Book, 'id'> }> = [];
+  let skippedCount = 0;
+  let totalCopies = 0;
+  const now = new Date().toISOString();
+  const stamp = Date.now();
+
+  params.rows.forEach((row, idx) => {
+    const title = (row.title || '').trim().slice(0, 200);
+    if (!title) {
+      skippedCount += 1;
+      return;
+    }
+
+    let finalBookNumber = (row.bookNumber || '')
+      .trim()
+      .replace(/[\s./\\]+/g, '-')
+      .replace(/[^a-zA-Z0-9_-]/g, '')
+      .slice(0, 32);
+
+    const isTaken = finalBookNumber
+      ? usedNumbers.has(finalBookNumber.toLowerCase())
+      : false;
+
+    if (!finalBookNumber) {
+      finalBookNumber = nextFreeNumber();
+    } else if (isTaken) {
+      if (params.duplicateStrategy === 'skip') {
+        skippedCount += 1;
+        return;
+      }
+      finalBookNumber = nextFreeNumber();
+    } else {
+      usedNumbers.add(finalBookNumber.toLowerCase());
+      const parsed = parseInt(finalBookNumber.replace(/\D/g, ''), 10);
+      if (!Number.isNaN(parsed) && parsed > maxNum) maxNum = parsed;
+    }
+
+    const qty = Math.max(1, Math.min(1000, Math.round(Number(row.quantity) || 1)));
+    totalCopies += qty;
+    const rand = Math.random().toString(36).slice(2, 6);
+    const bookId = `book_${stamp}_${idx}_${rand}`;
+
+    toInsert.push({
+      id: bookId,
+      data: {
+        bookNumber: finalBookNumber,
+        title,
+        author: (row.author || '').trim().slice(0, 160),
+        category: (row.category || '').trim().slice(0, 80) || 'Umumiy',
+        description: (row.description || '').trim().slice(0, 1000),
+        coverUrl: DEFAULT_BOOK_COVER_URL,
+        quantity: qty,
+        availableQuantity: qty,
+        status: 'mavjud',
+        isActive: true,
+        isDeleted: false,
+        borrowCount: 0,
+        createdAt: now,
+        updatedAt: now,
+      },
+    });
+  });
+
+  if (toInsert.length === 0) {
+    return { importedCount: 0, skippedCount, totalCopies: 0 };
+  }
+
+  const CHUNK_SIZE = 250;
+  const baseMs = Date.now();
+  let done = 0;
+  for (let i = 0; i < toInsert.length; i += CHUNK_SIZE) {
+    const chunkIdx = Math.floor(i / CHUNK_SIZE);
+    const chunkUpdatedAt = new Date(baseMs + chunkIdx).toISOString();
+    const slice = toInsert.slice(i, i + CHUNK_SIZE);
+
+    const commitChunk = async () => {
+      const batch = writeBatch(db);
+      for (const item of slice) {
+        batch.set(doc(db, 'books', item.id), {
+          ...item.data,
+          updatedAt: chunkUpdatedAt,
+        });
+      }
+      await batch.commit();
+    };
+
+    try {
+      await commitChunk();
+    } catch {
+      await new Promise((r) => setTimeout(r, 400));
+      await commitChunk();
+    }
+
+    done += slice.length;
+    params.onProgress?.(done, toInsert.length);
+    if (done < toInsert.length) {
+      await new Promise((r) => setTimeout(r, 30));
+    }
+  }
+
+  logAdminActivityNonBlocking({
+    action: 'Excel orqali kitoblar import qilindi',
+    targetType: 'book',
+    targetId: 'excel-import',
+    targetLabel: `${toInsert.length} ta kitob`,
+    details: `Excel fayldan ${toInsert.length} ta kitob (jami ${totalCopies} dona nusxa) qo‘shildi, ${skippedCount} ta o‘tkazib yuborildi.`,
+  });
+
+  return {
+    importedCount: toInsert.length,
+    skippedCount,
+    totalCopies,
+  };
 }
 
 export async function updateBookAdmin(
@@ -1898,7 +2687,25 @@ export async function updateBookAdmin(
     patch.coverUrl = updates.coverUrl;
   }
 
-  await updateDoc(doc(db, 'books', bookId), patch);
+  const fallbackBaseBook: Omit<Book, 'id'> = currentBook ||
+    (await getBundledBookById(bookId)) || {
+      bookNumber,
+      title,
+      author: updates.author.trim(),
+      category: updates.category.trim() || 'Umumiy',
+      description: updates.description.trim(),
+      coverUrl: updates.coverUrl ?? DEFAULT_BOOK_COVER_URL,
+      quantity: newQty,
+      availableQuantity: nextAvailable,
+      status: nextStatus,
+      isActive: true,
+      isDeleted: false,
+      borrowCount: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+  await upsertBookDoc(bookId, fallbackBaseBook, patch);
   logAdminActivityNonBlocking({
     action: 'Kitob tahrirlandi',
     targetType: 'book',
@@ -1917,7 +2724,7 @@ export async function toggleBookActiveAdmin(book: Book): Promise<void> {
   const nextActive = !book.isActive;
   const nextStatus = nextActive ? (avail > 0 ? 'mavjud' : 'olingan') : 'faol_emas';
 
-  await updateDoc(doc(db, 'books', book.id), {
+  await upsertBookDoc(book.id, book, {
     isActive: nextActive,
     status: nextStatus,
     updatedAt: new Date().toISOString(),
@@ -1933,7 +2740,7 @@ export async function toggleBookActiveAdmin(book: Book): Promise<void> {
 }
 
 export async function softDeleteBookAdmin(book: Book): Promise<void> {
-  await updateDoc(doc(db, 'books', book.id), {
+  await upsertBookDoc(book.id, book, {
     isDeleted: true,
     isActive: false,
     status: 'faol_emas',
@@ -1945,6 +2752,28 @@ export async function softDeleteBookAdmin(book: Book): Promise<void> {
     targetId: book.id,
     targetLabel: `${book.bookNumber} · ${book.title}`,
     details: 'Kitob katalogdan o‘chirildi, tarixiy yozuvlar saqlab qolindi.',
+  });
+}
+
+export async function restoreBookAdmin(book: Book): Promise<void> {
+  const avail = getBookAvailableCount(book);
+  const totalQty = Math.max(1, book.quantity || 1);
+  const nextAvail = Math.min(totalQty, avail);
+  const nextStatus: Book['status'] = nextAvail > 0 ? 'mavjud' : 'olingan';
+
+  await upsertBookDoc(book.id, book, {
+    isDeleted: false,
+    isActive: true,
+    availableQuantity: nextAvail,
+    status: nextStatus,
+    updatedAt: new Date().toISOString(),
+  });
+  logAdminActivityNonBlocking({
+    action: 'O‘chirilgan kitob tiklandi',
+    targetType: 'book',
+    targetId: book.id,
+    targetLabel: `${book.bookNumber} · ${book.title}`,
+    details: 'Kitob ma’lumotlar bazasidan qayta faol katalogga tiklandi.',
   });
 }
 
@@ -2158,14 +2987,28 @@ export async function updateLibrarySettingsAdmin(params: {
 }
 
 export async function createFullBackupPayload(): Promise<Record<string, unknown>> {
-  const [booksSnap, studentsSnap, txSnap, sigSnap, logsSnap, settingsSnap] = await Promise.all([
-    getDocs(collection(db, 'books')),
-    getDocs(collection(db, 'students')),
-    getDocs(collection(db, 'transactions')),
-    getDocs(collection(db, 'signatures')),
-    getDocs(collection(db, 'activityLogs')),
-    getDoc(doc(db, 'settings', 'library')),
-  ]);
+  const [bundledMap, booksSnap, studentsSnap, txSnap, sigSnap, logsSnap, settingsSnap] =
+    await Promise.all([
+      loadBundledCatalog(),
+      getDocs(collection(db, 'books')),
+      getDocs(collection(db, 'students')),
+      getDocs(collection(db, 'transactions')),
+      getDocs(collection(db, 'signatures')),
+      getDocs(collection(db, 'activityLogs')),
+      getDoc(doc(db, 'settings', 'library')),
+    ]);
+
+  const mergedBooks = new Map<string, Book>();
+  for (const [id, b] of bundledMap) {
+    mergedBooks.set(id, b);
+  }
+  booksSnap.forEach((d) => {
+    const normalized = normalizeBookDoc(d.id, d.data() as Record<string, unknown>);
+    if (isAllowedFirestoreBook(d.id, normalized, bundledMap)) {
+      mergedBooks.set(d.id, normalized);
+    }
+  });
+  const allBackupBooks = Array.from(mergedBooks.values());
 
   const now = new Date().toISOString();
   await updateDoc(doc(db, 'settings', 'library'), {
@@ -2178,14 +3021,14 @@ export async function createFullBackupPayload(): Promise<Record<string, unknown>
     targetType: 'backup',
     targetId: 'full',
     targetLabel: 'JSON zaxira fayli',
-    details: `Kitoblar: ${booksSnap.size}, Operatsiyalar: ${txSnap.size}, Imzolar: ${sigSnap.size}`,
+    details: `Kitoblar: ${allBackupBooks.length}, Operatsiyalar: ${txSnap.size}, Imzolar: ${sigSnap.size}`,
   });
 
   return {
     exportedAt: now,
     version: '1.0',
     settings: settingsSnap.exists() ? settingsSnap.data() : null,
-    books: booksSnap.docs.map((d) => ({ id: d.id, ...d.data() })),
+    books: allBackupBooks,
     students: studentsSnap.docs.map((d) => ({ id: d.id, ...d.data() })),
     transactions: txSnap.docs.map((d) => ({ id: d.id, ...d.data() })),
     signatures: sigSnap.docs.map((d) => ({ id: d.id, ...d.data() })),

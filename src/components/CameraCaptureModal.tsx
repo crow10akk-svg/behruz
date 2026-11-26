@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { Camera, Check, RefreshCw, X } from 'lucide-react';
+import { Camera, Check, RefreshCw, SwitchCamera, X } from 'lucide-react';
+import { openCameraStream, type CameraFacingMode } from '../lib/cameraUtils.ts';
 import { compressImageElementToDataUrl } from '../lib/imageUtils.ts';
 
 interface CameraCaptureModalProps {
@@ -15,6 +16,7 @@ export function CameraCaptureModal({
 }: CameraCaptureModalProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const [facingMode, setFacingMode] = useState<CameraFacingMode>('environment');
   const [capturedUrl, setCapturedUrl] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isStarting, setIsStarting] = useState(false);
@@ -26,18 +28,13 @@ export function CameraCaptureModal({
     }
   };
 
-  const startCamera = async () => {
+  const startCamera = async (targetFacing: CameraFacingMode = facingMode) => {
+    stopStream();
     setErrorMsg(null);
     setCapturedUrl(null);
     setIsStarting(true);
     try {
-      if (!navigator.mediaDevices?.getUserMedia) {
-        throw new Error('Brauzer kameraga ulanishni qo‘llab-quvvatlamaydi.');
-      }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 960 } },
-        audio: false,
-      });
+      const stream = await openCameraStream(targetFacing, { width: 1280, height: 960 });
       streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
@@ -58,7 +55,7 @@ export function CameraCaptureModal({
 
   useEffect(() => {
     if (isOpen) {
-      startCamera();
+      void startCamera(facingMode);
     } else {
       stopStream();
       setCapturedUrl(null);
@@ -71,6 +68,11 @@ export function CameraCaptureModal({
 
   if (!isOpen) return null;
 
+  const handleSwitchCamera = (nextFacing: CameraFacingMode) => {
+    setFacingMode(nextFacing);
+    void startCamera(nextFacing);
+  };
+
   const handleTakeShot = () => {
     const video = videoRef.current;
     if (!video || video.videoWidth === 0) return;
@@ -80,7 +82,7 @@ export function CameraCaptureModal({
   };
 
   const handleRetake = () => {
-    startCamera();
+    void startCamera(facingMode);
   };
 
   const handleConfirm = () => {
@@ -110,17 +112,56 @@ export function CameraCaptureModal({
         </div>
 
         <div className="p-5 space-y-4">
+          {!capturedUrl && (
+            <div className="grid grid-cols-2 gap-2 p-1 rounded-xl bg-slate-100 border border-slate-200">
+              <button
+                type="button"
+                onClick={() => handleSwitchCamera('environment')}
+                className={`min-h-[38px] px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                  facingMode === 'environment'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Orqa kamera
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSwitchCamera('user')}
+                className={`min-h-[38px] px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                  facingMode === 'user'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Old kamera
+              </button>
+            </div>
+          )}
+
           {errorMsg ? (
             <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800 space-y-3">
               <p>{errorMsg}</p>
-              <button
-                type="button"
-                onClick={startCamera}
-                className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold bg-white border border-red-200 text-red-700 rounded-lg hover:bg-red-100 transition-colors"
-              >
-                <RefreshCw className="w-4 h-4" />
-                <span>Qayta urinish</span>
-              </button>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => void startCamera(facingMode)}
+                  className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold bg-white border border-red-200 text-red-700 rounded-lg hover:bg-red-100 transition-colors"
+                >
+                  <RefreshCw className="w-4 h-4" />
+                  <span>Qayta urinish</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleSwitchCamera(facingMode === 'environment' ? 'user' : 'environment')
+                  }
+                  className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold bg-white border border-slate-200 text-slate-700 rounded-lg hover:bg-slate-100 transition-colors"
+                >
+                  <SwitchCamera className="w-4 h-4" />
+                  <span>{facingMode === 'environment' ? 'Old kamerani sinash' : 'Orqa kamerani sinash'}</span>
+                </button>
+              </div>
             </div>
           ) : (
             <div className="relative aspect-[3/4] max-h-[380px] mx-auto rounded-xl overflow-hidden bg-slate-900 border border-slate-200 flex items-center justify-center">
@@ -134,9 +175,12 @@ export function CameraCaptureModal({
                 <>
                   <video
                     ref={videoRef}
+                    autoPlay
                     playsInline
                     muted
-                    className="w-full h-full object-cover"
+                    className={`w-full h-full object-cover ${
+                      facingMode === 'user' ? 'scale-x-[-1]' : ''
+                    }`}
                   />
                   {isStarting && (
                     <div className="absolute inset-0 bg-slate-900/80 flex items-center justify-center text-sm text-slate-200">
@@ -148,7 +192,7 @@ export function CameraCaptureModal({
             </div>
           )}
 
-          <div className="flex items-center justify-end gap-3 pt-1">
+          <div className="flex flex-wrap items-center justify-end gap-2.5 pt-1">
             <button
               type="button"
               onClick={onClose}
@@ -177,15 +221,28 @@ export function CameraCaptureModal({
               </>
             ) : (
               !errorMsg && (
-                <button
-                  type="button"
-                  onClick={handleTakeShot}
-                  disabled={isStarting}
-                  className="inline-flex items-center gap-2 min-h-[44px] px-5 py-2 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-50 rounded-xl transition-colors"
-                >
-                  <Camera className="w-4 h-4" />
-                  <span>Rasmga olish</span>
-                </button>
+                <>
+                  <button
+                    type="button"
+                    disabled={isStarting}
+                    onClick={() =>
+                      handleSwitchCamera(facingMode === 'environment' ? 'user' : 'environment')
+                    }
+                    className="inline-flex items-center gap-2 min-h-[44px] px-3.5 py-2 text-xs sm:text-sm font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 rounded-xl transition-colors"
+                  >
+                    <SwitchCamera className="w-4 h-4" />
+                    <span>{facingMode === 'environment' ? 'Old kamera' : 'Orqa kamera'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleTakeShot}
+                    disabled={isStarting}
+                    className="inline-flex items-center gap-2 min-h-[44px] px-5 py-2 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-50 rounded-xl transition-colors"
+                  >
+                    <Camera className="w-4 h-4" />
+                    <span>Rasmga olish</span>
+                  </button>
+                </>
               )
             )}
           </div>

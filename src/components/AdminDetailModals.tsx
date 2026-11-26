@@ -15,7 +15,9 @@ import {
 } from 'lucide-react';
 import {
   deleteFaceProfileAdmin,
+  fetchSignaturesByStudentId,
   getFaceProfileById,
+  getSignatureById,
 } from '../lib/libraryService.ts';
 import { makeFaceProfileId } from '../lib/faceService.ts';
 import { formatUzDate, formatUzDateTime, isOverdueDate } from '../lib/imageUtils.ts';
@@ -37,10 +39,12 @@ export function TransactionDetailModal({
   onDeleteTransaction,
 }: TransactionDetailModalProps) {
   const [faceProfile, setFaceProfile] = useState<FaceProfile | null>(null);
+  const [fetchedSigs, setFetchedSigs] = useState<Record<string, SignatureRecord>>({});
 
   useEffect(() => {
     if (!transaction) {
       setFaceProfile(null);
+      setFetchedSigs({});
       return;
     }
     let cancelled = false;
@@ -58,18 +62,37 @@ export function TransactionDetailModal({
       .catch(() => {
         if (!cancelled) setFaceProfile(null);
       });
+
+    const missingIds = [transaction.borrowSignatureId, transaction.returnSignatureId].filter(
+      (id): id is string => Boolean(id && !signatures[id])
+    );
+    if (missingIds.length > 0) {
+      void Promise.all(missingIds.map((id) => getSignatureById(id).catch(() => null))).then(
+        (results) => {
+          if (cancelled) return;
+          const next: Record<string, SignatureRecord> = {};
+          results.forEach((sig) => {
+            if (sig) next[sig.id] = sig;
+          });
+          if (Object.keys(next).length > 0) {
+            setFetchedSigs((prev) => ({ ...prev, ...next }));
+          }
+        }
+      );
+    }
+
     return () => {
       cancelled = true;
     };
-  }, [transaction]);
+  }, [transaction, signatures]);
 
   if (!transaction) return null;
 
   const borrowSig = transaction.borrowSignatureId
-    ? signatures[transaction.borrowSignatureId]
+    ? signatures[transaction.borrowSignatureId] || fetchedSigs[transaction.borrowSignatureId]
     : undefined;
   const returnSig = transaction.returnSignatureId
-    ? signatures[transaction.returnSignatureId]
+    ? signatures[transaction.returnSignatureId] || fetchedSigs[transaction.returnSignatureId]
     : undefined;
   const isActiveBorrow = transaction.type === 'borrow' && transaction.status === 'active';
   const overdue = isActiveBorrow && isOverdueDate(transaction.dueDate);
@@ -124,6 +147,11 @@ export function TransactionDetailModal({
               <span className="text-xs font-mono text-blue-700 block mt-0.5 tabular-nums">
                 Inventar raqami: {transaction.bookNumber}
               </span>
+              {transaction.extraBookNumber && (
+                <span className="text-xs font-mono text-amber-800 block mt-0.5 tabular-nums">
+                  Qo‘shimcha raqam: {transaction.extraBookNumber}
+                </span>
+              )}
             </div>
 
             <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200">
@@ -261,10 +289,12 @@ export function StudentHistoryModal({
 }: StudentHistoryModalProps) {
   const [faceProfile, setFaceProfile] = useState<FaceProfile | null>(null);
   const [resettingFace, setResettingFace] = useState(false);
+  const [studentFetchedSigs, setStudentFetchedSigs] = useState<Record<string, SignatureRecord>>({});
 
   useEffect(() => {
     if (!student) {
       setFaceProfile(null);
+      setStudentFetchedSigs({});
       return;
     }
     let cancelled = false;
@@ -276,6 +306,20 @@ export function StudentHistoryModal({
       .catch(() => {
         if (!cancelled) setFaceProfile(null);
       });
+
+    void fetchSignaturesByStudentId(student.id)
+      .then((items) => {
+        if (cancelled) return;
+        const map: Record<string, SignatureRecord> = {};
+        items.forEach((s) => {
+          map[s.id] = s;
+        });
+        setStudentFetchedSigs(map);
+      })
+      .catch(() => {
+        if (!cancelled) setStudentFetchedSigs({});
+      });
+
     return () => {
       cancelled = true;
     };
@@ -283,11 +327,15 @@ export function StudentHistoryModal({
 
   if (!student) return null;
 
+  const mergedSignatures: Record<string, SignatureRecord> = {
+    ...studentFetchedSigs,
+    ...signatures,
+  };
   const studentTxs = transactions.filter((t) => t.studentId === student.id);
   const activeBorrows = studentTxs.filter(
     (t) => t.type === 'borrow' && t.status === 'active'
   );
-  const studentSigs = Object.values(signatures).filter(
+  const studentSigs = Object.values(mergedSignatures).filter(
     (s) => s.studentId === student.id
   );
 
@@ -471,7 +519,7 @@ export function StudentHistoryModal({
                   {studentTxs.map((tx) => {
                     const sigId =
                       tx.type === 'borrow' ? tx.borrowSignatureId : tx.returnSignatureId;
-                    const sig = sigId ? signatures[sigId] : undefined;
+                    const sig = sigId ? mergedSignatures[sigId] : undefined;
                     return (
                       <tr key={tx.id} className="hover:bg-slate-50/60">
                         <td className="py-2.5 px-3 font-semibold">
@@ -485,7 +533,14 @@ export function StudentHistoryModal({
                           )}
                         </td>
                         <td className="py-2.5 px-3 font-medium text-slate-900">{tx.bookTitle}</td>
-                        <td className="py-2.5 px-3 font-mono tabular-nums">{tx.bookNumber}</td>
+                        <td className="py-2.5 px-3 font-mono tabular-nums">
+                          <span>{tx.bookNumber}</span>
+                          {tx.extraBookNumber && (
+                            <span className="block text-[10px] text-amber-700">
+                              Qo‘sh: {tx.extraBookNumber}
+                            </span>
+                          )}
+                        </td>
                         <td className="py-2.5 px-3 font-mono tabular-nums text-slate-600">
                           {formatUzDateTime(tx.borrowedAt)}
                         </td>

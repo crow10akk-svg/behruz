@@ -129,10 +129,12 @@ export function buildReportData(
     }
 
     case 'top-books': {
-      const sorted = [...books].sort((a, b) => (b.borrowCount || 0) - (a.borrowCount || 0));
+      const sorted = [...books]
+        .sort((a, b) => (b.borrowCount || 0) - (a.borrowCount || 0))
+        .slice(0, 500);
       return {
         title: 'Eng ko‘p olingan kitoblar hisoboti',
-        subtitle: `Jami katalog: ${sorted.length} ta kitob`,
+        subtitle: `Jami katalog: ${books.length} ta kitob (Top ${sorted.length} ta ko‘rsatilgan)`,
         columns: ['Raqami', 'Kitob nomi', 'Muallif', 'Kategoriya', 'Olinishlar soni', 'Qoldiq / Holat'],
         rows: sorted.map((b) => {
           const avail = getBookAvailableCount(b);

@@ -73,6 +73,7 @@ export interface TransactionRecord {
   borrowSignatureId?: string;
   returnSignatureId?: string;
   faceProfileId?: string;
+  extraBookNumber?: string;
   adminOverride?: boolean;
   createdAt: string;
 }
@@ -125,6 +126,7 @@ export interface OfflinePendingAction {
   payload: {
     bookId: string;
     bookNumber: string;
+    extraBookNumber?: string;
     bookTitle: string;
     author?: string;
     category?: string;
@@ -159,4 +161,5 @@ export type AdminMenuId =
   | 'students'
   | 'search'
   | 'reports'
+  | 'database'
   | 'settings';

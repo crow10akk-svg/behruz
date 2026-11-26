@@ -1,4 +1,4 @@
-const CACHE_NAME = 'smart-kutubxona-static-v1';
+const CACHE_NAME = 'smart-kutubxona-static-v3';
 const PRECACHE_URLS = [
   '/',
   '/index.html',
@@ -33,8 +33,28 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
 
-  // Cache-first for immutable face recognition weights and built assets
-  if (url.pathname.startsWith('/face-models/') || url.pathname.startsWith('/assets/')) {
+  // Network-first with cache fallback for HTML navigation and root shell
+  if (req.mode === 'navigate' || url.pathname === '/' || url.pathname === '/index.html') {
+    event.respondWith(
+      fetch(req)
+        .then((res) => {
+          if (res.ok) {
+            const copy = res.clone();
+            void caches.open(CACHE_NAME).then((c) => c.put(req, copy).catch(() => {}));
+          }
+          return res;
+        })
+        .catch(() => caches.match('/index.html'))
+    );
+    return;
+  }
+
+  // Cache-first for immutable face recognition weights, catalog snapshot, and hashed assets
+  if (
+    url.pathname.startsWith('/face-models/') ||
+    url.pathname.startsWith('/assets/') ||
+    url.pathname.startsWith('/data/')
+  ) {
     event.respondWith(
       caches.match(req).then(
         (cached) =>
@@ -42,27 +62,11 @@ self.addEventListener('fetch', (event) => {
           fetch(req).then((res) => {
             if (res.ok) {
               const copy = res.clone();
-              void caches.open(CACHE_NAME).then((c) => c.put(req, copy));
+              void caches.open(CACHE_NAME).then((c) => c.put(req, copy).catch(() => {}));
             }
             return res;
           })
       )
-    );
-    return;
-  }
-
-  // Network-first with cache fallback for HTML navigation
-  if (req.mode === 'navigate') {
-    event.respondWith(
-      fetch(req)
-        .then((res) => {
-          if (res.ok) {
-            const copy = res.clone();
-            void caches.open(CACHE_NAME).then((c) => c.put(req, copy));
-          }
-          return res;
-        })
-        .catch(() => caches.match('/index.html'))
     );
   }
 });

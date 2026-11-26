@@ -4,10 +4,13 @@ import {
   Camera,
   CheckCircle2,
   RefreshCw,
+  SwitchCamera,
   Upload,
   WifiOff,
   X,
 } from 'lucide-react';
+import { openCameraStream, type CameraFacingMode } from '../lib/cameraUtils.ts';
+import { BookCoverImage } from './BookCoverImage.tsx';
 import { SignaturePad } from './SignaturePad.tsx';
 import {
   FaceCaptureBox,
@@ -26,10 +29,12 @@ import {
 import {
   compressFileToDataUrl,
   compressImageElementToDataUrl,
+  DEFAULT_BOOK_COVER_URL,
   formatUzDate,
   formatUzDateTime,
   makeSafeDocId,
 } from '../lib/imageUtils.ts';
+import { isQuotaExceededError } from '../lib/firebase.ts';
 import type { Book, FaceProfile, OfflinePendingAction } from '../types.ts';
 
 interface NewBookBorrowModalProps {
@@ -54,13 +59,16 @@ export function NewBookBorrowModal({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const frontCameraInputRef = useRef<HTMLInputElement | null>(null);
 
   const [cameraActive, setCameraActive] = useState(false);
+  const [facingMode, setFacingMode] = useState<CameraFacingMode>('environment');
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [coverUrl, setCoverUrl] = useState<string>('');
 
   const [bookTitle, setBookTitle] = useState('');
   const [bookNumber, setBookNumber] = useState(suggestedBookNumber);
+  const [extraBookNumber, setExtraBookNumber] = useState('');
   const [quantity, setQuantity] = useState(1);
   const [author, setAuthor] = useState('');
 
@@ -82,6 +90,7 @@ export function NewBookBorrowModal({
   const [receipt, setReceipt] = useState<{
     bookTitle: string;
     bookNumber: string;
+    extraBookNumber?: string;
     coverUrl: string;
     studentName: string;
     group: string;
@@ -99,34 +108,50 @@ export function NewBookBorrowModal({
     setCameraActive(false);
   };
 
-  const startCamera = async () => {
+  useEffect(() => {
+    if (!cameraActive || !streamRef.current || !videoRef.current) return;
+    const video = videoRef.current;
+    if (video.srcObject !== streamRef.current) {
+      video.srcObject = streamRef.current;
+    }
+    void video.play().catch(() => {
+      // ignore autoplay block
+    });
+  }, [cameraActive, facingMode]);
+
+  const startCamera = async (targetFacing: CameraFacingMode = facingMode) => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
     setCameraError(null);
     try {
-      if (!navigator.mediaDevices?.getUserMedia) {
-        throw new Error('Brauzer kamerani qo‘llab-quvvatlamaydi');
-      }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 960 } },
-        audio: false,
-      });
+      const stream = await openCameraStream(targetFacing, { width: 1280, height: 960 });
       streamRef.current = stream;
+      setFacingMode(targetFacing);
       setCameraActive(true);
-      requestAnimationFrame(async () => {
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          try {
-            await videoRef.current.play();
-          } catch {
+      requestAnimationFrame(() => {
+        if (videoRef.current && streamRef.current) {
+          videoRef.current.srcObject = streamRef.current;
+          void videoRef.current.play().catch(() => {
             // ignore autoplay block
-          }
+          });
         }
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Kamera ruxsati berilmadi';
       setCameraError(
-        `Kameraga ulanib bo‘lmadi (${msg}). Quyidagi tugma orqali kitob rasmini fayldan tanlashingiz mumkin.`
+        `Kameraga ulanib bo‘lmadi (${msg}). Quyidagi «Old kamera» yoki «Fayldan» tugmasi orqali rasm olishingiz mumkin.`
       );
       setCameraActive(false);
+    }
+  };
+
+  const handleToggleFacing = () => {
+    const next: CameraFacingMode = facingMode === 'environment' ? 'user' : 'environment';
+    setFacingMode(next);
+    if (cameraActive) {
+      void startCamera(next);
     }
   };
 
@@ -135,6 +160,7 @@ export function NewBookBorrowModal({
       setCoverUrl('');
       setBookTitle('');
       setBookNumber(suggestedBookNumber);
+      setExtraBookNumber('');
       setQuantity(1);
       setAuthor('');
       setFirstName('');
@@ -149,7 +175,6 @@ export function NewBookBorrowModal({
       setErrorMsg(null);
       setOfflineNotice(null);
       setReceipt(null);
-      startCamera();
     } else {
       stopCamera();
     }
@@ -224,7 +249,7 @@ export function NewBookBorrowModal({
   };
 
   const isNetworkFailure = (err: unknown): boolean => {
-    if (!navigator.onLine) return true;
+    if (!navigator.onLine || isQuotaExceededError(err)) return true;
     const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
     return (
       msg.includes('offline') ||
@@ -239,10 +264,6 @@ export function NewBookBorrowModal({
     setErrorMsg(null);
     setOfflineNotice(null);
 
-    if (!coverUrl) {
-      setErrorMsg('Iltimos, avval yangi kitobning rasmini kameradan oling yoki yuklang.');
-      return;
-    }
     if (!bookTitle.trim()) {
       setErrorMsg('Kitob nomini kiriting.');
       return;
@@ -260,6 +281,9 @@ export function NewBookBorrowModal({
       return;
     }
 
+    const effectiveCoverUrl = coverUrl || DEFAULT_BOOK_COVER_URL;
+    const cleanExtraBookNumber = extraBookNumber.trim().slice(0, 64);
+
     const { borrowedAtIso, dueDateIso } = buildBorrowAndDueIso(
       borrowDateStr,
       defaultLoanDays
@@ -273,11 +297,12 @@ export function NewBookBorrowModal({
         payload: {
           bookId: '',
           bookNumber: bookNumber.trim() || suggestedBookNumber,
+          ...(cleanExtraBookNumber ? { extraBookNumber: cleanExtraBookNumber } : {}),
           bookTitle: bookTitle.trim(),
           author: author.trim(),
           category: 'Umumiy',
           quantity: Math.max(1, Number(quantity) || 1),
-          coverUrl,
+          coverUrl: effectiveCoverUrl,
           firstName: firstName.trim(),
           lastName: lastName.trim(),
           group: group.trim(),
@@ -306,9 +331,10 @@ export function NewBookBorrowModal({
       const res = await borrowNewUnlistedBookAtomic({
         title: bookTitle,
         bookNumber,
+        extraBookNumber: cleanExtraBookNumber || undefined,
         author,
         quantity,
-        coverUrl,
+        coverUrl: effectiveCoverUrl,
         firstName,
         lastName,
         group,
@@ -324,7 +350,8 @@ export function NewBookBorrowModal({
       setReceipt({
         bookTitle: bookTitle.trim(),
         bookNumber: res.bookNumber,
-        coverUrl,
+        ...(cleanExtraBookNumber ? { extraBookNumber: cleanExtraBookNumber } : {}),
+        coverUrl: effectiveCoverUrl,
         studentName: `${firstName.trim()} ${lastName.trim()}`,
         group: group.trim(),
         course: course.trim(),
@@ -341,11 +368,12 @@ export function NewBookBorrowModal({
           payload: {
             bookId: '',
             bookNumber: bookNumber.trim() || suggestedBookNumber,
+            ...(cleanExtraBookNumber ? { extraBookNumber: cleanExtraBookNumber } : {}),
             bookTitle: bookTitle.trim(),
             author: author.trim(),
             category: 'Umumiy',
             quantity: Math.max(1, Number(quantity) || 1),
-            coverUrl,
+            coverUrl: effectiveCoverUrl,
             firstName: firstName.trim(),
             lastName: lastName.trim(),
             group: group.trim(),
@@ -353,11 +381,18 @@ export function NewBookBorrowModal({
             borrowedAtIso,
             dueDateIso,
             signatureDataUrl,
+            ...(capturedFaceEnrollment
+              ? {
+                  facePhotoUrl: capturedFaceEnrollment.facePhotoUrl,
+                  faceDescriptor: capturedFaceEnrollment.faceDescriptor,
+                  descriptorHash: capturedFaceEnrollment.descriptorHash,
+                }
+              : {}),
           },
         });
         onOfflineQueued(nextQ);
         setOfflineNotice(
-          'Server bilan aloqa uzildi. Operatsiya saqlandi va aloqa tiklanishi bilan avtomatik yuboriladi.'
+          'Server bilan aloqa uzildi yoki kunlik limit to‘ldi. Operatsiya saqlandi va tizim tiklanishi bilan avtomatik yuboriladi.'
         );
       } else {
         setErrorMsg(
@@ -370,15 +405,15 @@ export function NewBookBorrowModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-950/60 flex items-center justify-center p-3 sm:p-5 overflow-y-auto">
+    <div className="fixed inset-0 z-50 bg-slate-950/60 flex items-start sm:items-center justify-center p-2.5 sm:p-5 overflow-y-auto">
       <div className="w-full max-w-3xl rounded-2xl bg-white border border-slate-200 shadow-2xl overflow-hidden my-auto">
-        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200 bg-slate-50/70">
+        <div className="flex items-center justify-between px-5 sm:px-6 py-4 border-b border-slate-200 bg-slate-50/70">
           <div>
             <h2 className="font-display text-xl font-bold text-slate-900">
               Yangi kitob olish
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Katalogda hali mavjud bo‘lmagan kitobni rasmga olib, ma’lumotlarini kiritib oling
+              Katalogda hali mavjud bo‘lmagan kitobni ma’lumotlarini kiritib oling
             </p>
           </div>
           <button
@@ -387,7 +422,7 @@ export function NewBookBorrowModal({
               stopCamera();
               onClose();
             }}
-            className="w-10 h-10 rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-200/70 hover:text-slate-900 transition-colors"
+            className="w-10 h-10 rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-200/70 hover:text-slate-900 transition-colors shrink-0"
             aria-label="Yopish"
           >
             <X className="w-5 h-5" />
@@ -414,6 +449,11 @@ export function NewBookBorrowModal({
                 <span className="font-semibold text-slate-900">
                   {receipt.bookTitle} (№ {receipt.bookNumber})
                 </span>
+                {receipt.extraBookNumber && (
+                  <span className="text-xs font-mono text-amber-800 block mt-0.5">
+                    Qo‘shimcha raqami: {receipt.extraBookNumber}
+                  </span>
+                )}
               </div>
               <div>
                 <span className="text-xs text-slate-500 block">O‘quvchi F.I.Sh.</span>
@@ -458,7 +498,7 @@ export function NewBookBorrowModal({
             </div>
           </div>
         ) : (
-          <form onSubmit={handleSubmit} className="p-6 space-y-6 max-h-[82vh] overflow-y-auto">
+          <form onSubmit={handleSubmit} className="p-5 sm:p-6 space-y-6 max-h-[85dvh] overflow-y-auto">
             {offlineNotice && (
               <div className="rounded-xl border border-amber-300 bg-amber-50 p-4 flex items-start gap-3 text-sm text-amber-900">
                 <WifiOff className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
@@ -473,32 +513,31 @@ export function NewBookBorrowModal({
               </div>
             )}
 
-            {/* Step 1: Inline Live Camera Capture for New Book */}
+            {/* Step 1: Book Cover Preview (Unified default cover, optional custom camera capture) */}
             <div className="space-y-3">
               <label className="text-sm font-semibold text-slate-800 block">
-                1. Kitob muqovasini rasmga olish *
+                1. Kitob muqovasi (umumiy yagona dizayn avtomatik qo‘yiladi)
               </label>
 
-              <div className="grid grid-cols-1 sm:grid-cols-[200px_1fr] gap-4 items-start">
-                <div className="relative aspect-[3/4] w-full max-w-[200px] mx-auto sm:mx-0 rounded-xl overflow-hidden bg-slate-900 border border-slate-200 flex items-center justify-center">
-                  {coverUrl ? (
-                    <img
-                      src={coverUrl}
-                      alt="Olingan kitob muqovasi"
-                      className="w-full h-full object-cover"
-                    />
-                  ) : cameraActive ? (
+              <div className="grid grid-cols-1 sm:grid-cols-[170px_1fr] gap-4 items-center">
+                <div className="relative aspect-[3/4] w-full max-w-[170px] mx-auto sm:mx-0 rounded-xl overflow-hidden bg-slate-900 border border-slate-200 flex items-center justify-center">
+                  {cameraActive ? (
                     <video
                       ref={videoRef}
+                      autoPlay
                       playsInline
                       muted
-                      className="w-full h-full object-cover"
+                      className={`w-full h-full object-cover ${
+                        facingMode === 'user' ? 'scale-x-[-1]' : ''
+                      }`}
                     />
                   ) : (
-                    <div className="text-center p-3 text-slate-300 text-xs space-y-2">
-                      <Camera className="w-8 h-8 mx-auto text-slate-400" />
-                      <span>Kitob rasmi olinmagan</span>
-                    </div>
+                    <BookCoverImage
+                      coverUrl={coverUrl}
+                      title={bookTitle || 'Yangi kitob'}
+                      bookNumber={bookNumber || suggestedBookNumber}
+                      className="w-full h-full"
+                    />
                   )}
                 </div>
 
@@ -509,51 +548,78 @@ export function NewBookBorrowModal({
                     </p>
                   )}
 
-                  <div className="flex flex-wrap gap-2.5">
-                    {cameraActive && !coverUrl ? (
-                      <button
-                        type="button"
-                        onClick={handleCapturePhoto}
-                        className="inline-flex items-center gap-2 min-h-[46px] px-5 py-2.5 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-xl transition-colors"
-                      >
-                        <Camera className="w-4 h-4" />
-                        <span>Rasmga olish</span>
-                      </button>
+                  <div className="flex flex-wrap gap-2">
+                    {cameraActive ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={handleCapturePhoto}
+                          className="inline-flex items-center gap-2 min-h-[42px] px-4 py-2 text-xs sm:text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-xl transition-colors"
+                        >
+                          <Camera className="w-4 h-4" />
+                          <span>Rasmga olish</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleToggleFacing}
+                          className="inline-flex items-center gap-1.5 min-h-[42px] px-3 py-2 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors"
+                        >
+                          <SwitchCamera className="w-4 h-4" />
+                          <span>{facingMode === 'environment' ? 'Old kamera' : 'Orqa kamera'}</span>
+                        </button>
+                      </>
                     ) : (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setCoverUrl('');
-                          startCamera();
-                        }}
-                        className="inline-flex items-center gap-2 min-h-[46px] px-4 py-2.5 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-xl transition-colors"
-                      >
-                        {coverUrl ? <RefreshCw className="w-4 h-4" /> : <Camera className="w-4 h-4" />}
-                        <span>{coverUrl ? 'Qayta rasmga olish' : 'Kamerani yoqish'}</span>
-                      </button>
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setCoverUrl('');
+                            void startCamera(facingMode);
+                          }}
+                          className="inline-flex items-center gap-2 min-h-[42px] px-4 py-2 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors"
+                        >
+                          {coverUrl ? <RefreshCw className="w-4 h-4" /> : <Camera className="w-4 h-4" />}
+                          <span>{coverUrl ? 'Qayta rasmga olish' : 'Kamera bilan rasm'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => frontCameraInputRef.current?.click()}
+                          className="inline-flex items-center gap-1.5 min-h-[42px] px-3.5 py-2 text-xs font-semibold text-blue-800 bg-blue-50 border border-blue-200 hover:bg-blue-100 rounded-xl transition-colors"
+                        >
+                          <Camera className="w-4 h-4" />
+                          <span>Old kamera</span>
+                        </button>
+                      </>
                     )}
 
                     <button
                       type="button"
                       onClick={() => fileInputRef.current?.click()}
-                      className="inline-flex items-center gap-2 min-h-[46px] px-4 py-2.5 text-sm font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors"
+                      className="inline-flex items-center gap-2 min-h-[42px] px-4 py-2 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors"
                     >
                       <Upload className="w-4 h-4" />
-                      <span>Fayldan tanlash</span>
+                      <span>Fayldan (ixtiyoriy)</span>
                     </button>
                   </div>
 
                   <p className="text-xs text-slate-500">
-                    Kitob muqovasi katalogda boshqa o‘quvchilar ham ko‘rishi uchun avtomatik saqlanadi.
+                    Barcha kitoblarga yagona IIV Andijon Akademik litseyi muqovasi va kitob nomi avtomatik biriktiriladi.
                   </p>
                 </div>
               </div>
 
               <input
+                ref={frontCameraInputRef}
+                type="file"
+                accept="image/*"
+                capture="user"
+                onChange={handleFileUpload}
+                className="hidden"
+              />
+              <input
                 ref={fileInputRef}
                 type="file"
                 accept="image/*"
-                capture="environment"
                 onChange={handleFileUpload}
                 className="hidden"
               />
@@ -603,6 +669,19 @@ export function NewBookBorrowModal({
                     value={quantity}
                     onChange={(e) => setQuantity(Number(e.target.value))}
                     className="w-full min-h-[44px] px-3.5 py-2 text-sm font-mono rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium text-slate-600 mb-1">
+                    Qo‘shimcha kitob raqami (ixtiyoriy — kitobning boshqacha nomi)
+                  </label>
+                  <input
+                    type="text"
+                    maxLength={64}
+                    value={extraBookNumber}
+                    onChange={(e) => setExtraBookNumber(e.target.value)}
+                    placeholder="Kitobning boshqacha nomi yoki qo‘shimcha raqami (majburiy emas)"
+                    className="w-full min-h-[44px] px-3.5 py-2 text-sm rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-600"
                   />
                 </div>
                 <div className="sm:col-span-2">

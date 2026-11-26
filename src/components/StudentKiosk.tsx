@@ -47,6 +47,7 @@ export function StudentKiosk({
   const [categoryFilter, setCategoryFilter] = useState<string>('all');
   const [selectedBook, setSelectedBook] = useState<Book | null>(null);
   const [isNewBookOpen, setIsNewBookOpen] = useState(false);
+  const [visibleBooksLimit, setVisibleBooksLimit] = useState(100);
   const [modalState, setModalState] = useState<{
     mode: 'borrow' | 'return' | null;
     book: Book | null;
@@ -201,7 +202,10 @@ export function StudentKiosk({
               <input
                 type="text"
                 value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
+                onChange={(e) => {
+                  setSearchQuery(e.target.value);
+                  setVisibleBooksLimit(100);
+                }}
                 placeholder="Kitob nomi, muallif yoki maxsus raqam (masalan: 001) bo‘yicha qidiring..."
                 className="w-full min-h-[52px] pl-12 pr-4 py-3 text-base rounded-xl border border-slate-300 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-600 transition-colors"
               />
@@ -243,7 +247,10 @@ export function StudentKiosk({
             <div className="inline-flex items-center gap-1 p-1 bg-slate-200/75 rounded-xl">
               <button
                 type="button"
-                onClick={() => setStatusFilter('all')}
+                onClick={() => {
+                  setStatusFilter('all');
+                  setVisibleBooksLimit(100);
+                }}
                 className={`min-h-[38px] px-3.5 py-1.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap ${
                   statusFilter === 'all'
                     ? 'bg-white text-slate-900 shadow-xs'
@@ -254,7 +261,10 @@ export function StudentKiosk({
               </button>
               <button
                 type="button"
-                onClick={() => setStatusFilter('mavjud')}
+                onClick={() => {
+                  setStatusFilter('mavjud');
+                  setVisibleBooksLimit(100);
+                }}
                 className={`min-h-[38px] px-3.5 py-1.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap ${
                   statusFilter === 'mavjud'
                     ? 'bg-white text-emerald-700 shadow-xs'
@@ -265,7 +275,10 @@ export function StudentKiosk({
               </button>
               <button
                 type="button"
-                onClick={() => setStatusFilter('olingan')}
+                onClick={() => {
+                  setStatusFilter('olingan');
+                  setVisibleBooksLimit(100);
+                }}
                 className={`min-h-[38px] px-3.5 py-1.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap ${
                   statusFilter === 'olingan'
                     ? 'bg-white text-amber-700 shadow-xs'
@@ -279,7 +292,10 @@ export function StudentKiosk({
             {categories.length > 0 && (
               <select
                 value={categoryFilter}
-                onChange={(e) => setCategoryFilter(e.target.value)}
+                onChange={(e) => {
+                  setCategoryFilter(e.target.value);
+                  setVisibleBooksLimit(100);
+                }}
                 aria-label="Fan bo‘yicha filtrlash"
                 className="min-h-[42px] px-3.5 py-2 text-xs font-semibold rounded-xl border border-slate-300 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-600"
               >
@@ -303,12 +319,30 @@ export function StudentKiosk({
             </button>
           </div>
 
-          <div className="flex items-center gap-2 text-xs text-slate-600 tabular-nums">
+          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600 tabular-nums">
             <span>{stats.total} ta kitob</span>
             <span aria-hidden="true">·</span>
             <span className="text-emerald-700 font-medium">{stats.available} ta mavjud</span>
             <span aria-hidden="true">·</span>
             <span className="text-amber-700 font-medium">{stats.locked} ta tugagan</span>
+            {filteredBooks.length > visibleBooksLimit && (
+              <>
+                <span aria-hidden="true">·</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setVisibleBooksLimit((prev) =>
+                      filteredBooks.length > 1000 ? Math.min(filteredBooks.length, prev + 500) : filteredBooks.length
+                    )
+                  }
+                  className="font-semibold text-blue-700 hover:underline"
+                >
+                  {filteredBooks.length > 1000
+                    ? `Yana 500 ta ko‘rsatish (${visibleBooksLimit}/${filteredBooks.length})`
+                    : `Barchasini ko‘rsatish (${filteredBooks.length} ta)`}
+                </button>
+              </>
+            )}
           </div>
         </div>
 
@@ -362,83 +396,109 @@ export function StudentKiosk({
             </div>
           </div>
         ) : (
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-5">
-            {filteredBooks.map((book) => {
-              const totalQty = Math.max(1, book.quantity || 1);
-              const availQty = getBookAvailableCount(book);
-              const isAvailable = availQty > 0;
-              const overdue = !isAvailable && isOverdueDate(book.currentDueDate);
-              return (
-                <button
-                  key={book.id}
-                  type="button"
-                  onClick={() => setSelectedBook(book)}
-                  className="group text-left rounded-2xl border border-slate-200 bg-white overflow-hidden hover:border-blue-500 hover:shadow-md transition-all flex flex-col focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600"
-                >
-                  <div className="aspect-[3/4] w-full overflow-hidden bg-slate-100 border-b border-slate-100 relative">
-                    <BookCoverImage
-                      coverUrl={book.coverUrl}
-                      title={book.title}
-                      bookNumber={book.bookNumber}
-                      className={`w-full h-full group-hover:scale-[1.03] transition-transform duration-200 ${
-                        !isAvailable ? 'opacity-70 grayscale-[35%]' : ''
-                      }`}
-                    />
-                    {!isAvailable && (
-                      <div className="absolute inset-0 bg-slate-950/35 flex items-center justify-center">
-                        <div className="bg-slate-900/90 text-white px-3 py-1.5 rounded-xl flex items-center gap-1.5 text-xs font-semibold shadow-sm">
-                          <Lock className="w-3.5 h-3.5 text-amber-300" />
-                          <span>Tugagan</span>
+          <div className="space-y-6">
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-5">
+              {filteredBooks.slice(0, visibleBooksLimit).map((book) => {
+                const totalQty = Math.max(1, book.quantity || 1);
+                const availQty = getBookAvailableCount(book);
+                const isAvailable = availQty > 0;
+                const overdue = !isAvailable && isOverdueDate(book.currentDueDate);
+                return (
+                  <button
+                    key={book.id}
+                    type="button"
+                    onClick={() => setSelectedBook(book)}
+                    className="group text-left rounded-2xl border border-slate-200 bg-white overflow-hidden hover:border-blue-500 hover:shadow-md transition-all flex flex-col focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600"
+                  >
+                    <div className="aspect-[3/4] w-full overflow-hidden bg-slate-100 border-b border-slate-100 relative">
+                      <BookCoverImage
+                        coverUrl={book.coverUrl}
+                        title={book.title}
+                        bookNumber={book.bookNumber}
+                        className={`w-full h-full group-hover:scale-[1.03] transition-transform duration-200 ${
+                          !isAvailable ? 'opacity-70 grayscale-[35%]' : ''
+                        }`}
+                      />
+                      {!isAvailable && (
+                        <div className="absolute inset-0 bg-slate-950/35 flex items-center justify-center">
+                          <div className="bg-slate-900/90 text-white px-3 py-1.5 rounded-xl flex items-center gap-1.5 text-xs font-semibold shadow-sm">
+                            <Lock className="w-3.5 h-3.5 text-amber-300" />
+                            <span>Tugagan</span>
+                          </div>
                         </div>
-                      </div>
-                    )}
-                  </div>
-                  <div className="p-4 flex-1 flex flex-col justify-between gap-2 w-full">
-                    <div className="space-y-1.5">
-                      <div className="flex items-center justify-between gap-2 text-xs">
-                        <span className="font-mono font-semibold text-slate-500 tabular-nums">
-                          № {book.bookNumber}
-                        </span>
-                        <span
-                          className={`inline-flex items-center gap-1 font-semibold tabular-nums ${
-                            isAvailable
-                              ? 'text-emerald-700'
-                              : overdue
-                                ? 'text-red-700'
-                                : 'text-amber-700'
-                          }`}
-                        >
-                          {isAvailable ? (
-                            <BookCheck className="w-3.5 h-3.5 shrink-0" />
-                          ) : (
-                            <Lock className="w-3.5 h-3.5 shrink-0" />
-                          )}
-                          <span>
-                            {isAvailable
-                              ? totalQty > 1
-                                ? `${availQty}/${totalQty} ta`
-                                : `${availQty} ta mavjud`
-                              : overdue
-                                ? 'Muddati o‘tgan'
-                                : 'Tugagan'}
-                          </span>
-                        </span>
-                      </div>
-
-                      <h3 className="font-display font-semibold text-sm sm:text-base text-slate-900 leading-snug line-clamp-2">
-                        {book.title}
-                      </h3>
+                      )}
                     </div>
+                    <div className="p-4 flex-1 flex flex-col justify-between gap-2 w-full">
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between gap-2 text-xs">
+                          <span className="font-mono font-semibold text-slate-500 tabular-nums">
+                            № {book.bookNumber}
+                          </span>
+                          {(!isAvailable || totalQty > 1) && (
+                            <span
+                              className={`inline-flex items-center gap-1 font-semibold tabular-nums ${
+                                isAvailable
+                                  ? 'text-emerald-700'
+                                  : overdue
+                                    ? 'text-red-700'
+                                    : 'text-amber-700'
+                              }`}
+                            >
+                              {isAvailable ? (
+                                <BookCheck className="w-3.5 h-3.5 shrink-0" />
+                              ) : (
+                                <Lock className="w-3.5 h-3.5 shrink-0" />
+                              )}
+                              <span>
+                                {isAvailable
+                                  ? `${availQty}/${totalQty} ta`
+                                  : overdue
+                                    ? 'Muddati o‘tgan'
+                                    : 'Tugagan'}
+                              </span>
+                            </span>
+                          )}
+                        </div>
 
-                    {book.author && (
-                      <p className="text-xs text-slate-500 truncate pt-1">
-                        {book.author}
-                      </p>
-                    )}
-                  </div>
+                        <h3 className="font-display font-semibold text-sm sm:text-base text-slate-900 leading-snug line-clamp-2">
+                          {book.title}
+                        </h3>
+                      </div>
+
+                      {book.author && (
+                        <p className="text-xs text-slate-500 truncate pt-1">
+                          {book.author}
+                        </p>
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+            {filteredBooks.length > visibleBooksLimit && (
+              <div className="flex flex-wrap items-center justify-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setVisibleBooksLimit((prev) => prev + 100)}
+                  className="min-h-[44px] px-6 py-2.5 text-xs sm:text-sm font-semibold text-white bg-[#0F2942] hover:bg-slate-800 rounded-xl transition-colors tabular-nums"
+                >
+                  Yana 100 ta kitob ko‘rsatish (qolgan: {filteredBooks.length - visibleBooksLimit} ta)
                 </button>
-              );
-            })}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setVisibleBooksLimit((prev) =>
+                      filteredBooks.length > 1000 ? Math.min(filteredBooks.length, prev + 500) : filteredBooks.length
+                    )
+                  }
+                  className="min-h-[44px] px-5 py-2.5 text-xs sm:text-sm font-semibold text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 rounded-xl transition-colors tabular-nums"
+                >
+                  {filteredBooks.length > 1000
+                    ? 'Yana 500 ta ko‘rsatish'
+                    : `Barchasini ko‘rsatish (${filteredBooks.length} ta)`}
+                </button>
+              </div>
+            )}
           </div>
         )}
       </main>

@@ -68,7 +68,7 @@ export function BookDetailModal({
                 {isAvailable ? (
                   <span className="inline-flex items-center gap-1.5 text-emerald-700 font-semibold">
                     <BookCheck className="w-4 h-4" />
-                    <span>Mavjud · {availQty} ta qolgan</span>
+                    <span>{totalQty > 1 ? `Mavjud · ${availQty}/${totalQty} ta` : 'Mavjud'}</span>
                   </span>
                 ) : isLockedOut ? (
                   <span

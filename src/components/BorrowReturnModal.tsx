@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useDeferredValue, useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
   Lock,
+  Search,
   WifiOff,
   X,
 } from 'lucide-react';
@@ -23,14 +24,24 @@ import {
 import {
   borrowBookAtomic,
   enqueueOfflineAction,
+  fetchActiveBorrowSummaries,
   getBookAvailableCount,
   lookupFaceProfilesByName,
   resolveReturnFaceRequirement,
   returnBookAtomic,
   verifyAdminPassword,
+  type ActiveBorrowBookSummary,
 } from '../lib/libraryService.ts';
-import { formatUzDate, formatUzDateTime, makeSafeDocId, normalizeCompareText } from '../lib/imageUtils.ts';
-import { scoreFuzzyMatch } from '../lib/autonomousEngine.ts';
+import {
+  formatUzDate,
+  formatUzDateTime,
+  makeSafeDocId,
+  normalizeCompareText,
+  toRelaxedPhonetic,
+  transliterateToLatinCanonical,
+} from '../lib/imageUtils.ts';
+import { isQuotaExceededError } from '../lib/firebase.ts';
+import { smartFilterBooks } from '../lib/autonomousEngine.ts';
 import type { Book, FaceProfile, OfflinePendingAction } from '../types.ts';
 
 interface BorrowReturnModalProps {
@@ -44,6 +55,43 @@ interface BorrowReturnModalProps {
 
 const COURSE_OPTIONS = ['1-kurs', '2-kurs'];
 
+function titlesMatchCrossScript(a: string, b: string): boolean {
+  const na = normalizeCompareText(a);
+  const nb = normalizeCompareText(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const ca = transliterateToLatinCanonical(a);
+  const cb = transliterateToLatinCanonical(b);
+  if (ca && ca === cb) return true;
+  return Boolean(ca && toRelaxedPhonetic(ca) === toRelaxedPhonetic(cb));
+}
+
+function findUniqueExactTitleMatch(pool: Book[], inputTitle: string): Book | null {
+  const normIn = normalizeCompareText(inputTitle);
+  if (!normIn) return null;
+
+  const exactRaw = pool.filter((b) => normalizeCompareText(b.title) === normIn);
+  if (exactRaw.length === 1) return exactRaw[0];
+  if (exactRaw.length > 1) return null;
+
+  const canonIn = transliterateToLatinCanonical(inputTitle);
+  if (canonIn) {
+    const exactCanon = pool.filter((b) => transliterateToLatinCanonical(b.title) === canonIn);
+    if (exactCanon.length === 1) return exactCanon[0];
+    if (exactCanon.length > 1) return null;
+
+    const relIn = toRelaxedPhonetic(canonIn);
+    if (relIn) {
+      const exactRel = pool.filter(
+        (b) => toRelaxedPhonetic(transliterateToLatinCanonical(b.title)) === relIn
+      );
+      if (exactRel.length === 1) return exactRel[0];
+    }
+  }
+
+  return null;
+}
+
 export function BorrowReturnModal({
   mode,
   books,
@@ -55,6 +103,8 @@ export function BorrowReturnModal({
   const [selectedBookId, setSelectedBookId] = useState<string>('');
   const [bookTitleInput, setBookTitleInput] = useState('');
   const [confirmBookNumber, setConfirmBookNumber] = useState('');
+  const [isAutoFilledBookNumber, setIsAutoFilledBookNumber] = useState(false);
+  const [extraBookNumber, setExtraBookNumber] = useState('');
 
   const [firstName, setFirstName] = useState('');
   const [lastName, setLastName] = useState('');
@@ -73,10 +123,15 @@ export function BorrowReturnModal({
   const [returnTargetFace, setReturnTargetFace] = useState<FaceProfile | null>(null);
   const [isResolvingReturnTarget, setIsResolvingReturnTarget] = useState(false);
   const [legacyNoFaceProfile, setLegacyNoFaceProfile] = useState(false);
+  const [requiresExtraBookNumber, setRequiresExtraBookNumber] = useState(false);
   const [verifiedFaceState, setVerifiedFaceState] = useState<VerifiedFaceState | null>(null);
 
   const [useAdminOverride, setUseAdminOverride] = useState(false);
   const [overridePassword, setOverridePassword] = useState('');
+  const [activeBorrowMap, setActiveBorrowMap] = useState<Map<string, ActiveBorrowBookSummary>>(
+    () => new Map()
+  );
+  const [isLoadingActiveBorrows, setIsLoadingActiveBorrows] = useState(false);
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -85,6 +140,7 @@ export function BorrowReturnModal({
     action: 'borrow' | 'return';
     bookTitle: string;
     bookNumber: string;
+    extraBookNumber?: string;
     studentName: string;
     group: string;
     course: string;
@@ -97,7 +153,9 @@ export function BorrowReturnModal({
     if (mode) {
       setSelectedBookId(initialBook?.id || '');
       setBookTitleInput(initialBook?.title || '');
-      setConfirmBookNumber(mode === 'return' && initialBook ? initialBook.bookNumber : '');
+      setConfirmBookNumber(initialBook ? initialBook.bookNumber : '');
+      setIsAutoFilledBookNumber(Boolean(initialBook));
+      setExtraBookNumber('');
       setFirstName('');
       setLastName('');
       setGroup('');
@@ -112,37 +170,98 @@ export function BorrowReturnModal({
       setReturnTargetFace(null);
       setIsResolvingReturnTarget(false);
       setLegacyNoFaceProfile(false);
+      setRequiresExtraBookNumber(false);
       setVerifiedFaceState(null);
       setUseAdminOverride(false);
       setOverridePassword('');
+      setActiveBorrowMap(new Map());
+      setIsLoadingActiveBorrows(false);
       setErrorMsg(null);
       setOfflineNotice(null);
       setReceipt(null);
     }
   }, [mode, initialBook, defaultLoanDays]);
 
-  const candidateBooks = useMemo(() => {
-    const titleQ = bookTitleInput.trim();
-    const numQ = confirmBookNumber.trim().toLowerCase();
-    const eligible = books.filter((b) => {
-      if (!b.isActive) return false;
+  // Return mode: sync active borrow transactions so all currently borrowed books appear immediately
+  useEffect(() => {
+    if (mode !== 'return') return;
+    let cancelled = false;
+    setIsLoadingActiveBorrows(true);
+    fetchActiveBorrowSummaries()
+      .then((map) => {
+        if (!cancelled) setActiveBorrowMap(map);
+      })
+      .catch(() => {
+        // Fallback to books cache if offline or transient read failure
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoadingActiveBorrows(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mode]);
+
+  const activeCatalogBooks = useMemo(
+    () => books.filter((b) => b.isActive && !b.isDeleted),
+    [books]
+  );
+
+  const eligibleBooks = useMemo(() => {
+    return activeCatalogBooks.filter((b) => {
       const avail = getBookAvailableCount(b);
       const totalQty = Math.max(1, b.quantity || 1);
       if (mode === 'borrow' && avail <= 0) return false;
-      if (mode === 'return' && avail >= totalQty) return false;
-      if (numQ && !b.bookNumber.toLowerCase().includes(numQ)) return false;
+      if (mode === 'return' && avail >= totalQty && !activeBorrowMap.has(b.id)) return false;
       return true;
     });
-    if (!titleQ) return eligible;
-    return eligible
-      .map((b) => ({
-        book: b,
-        score: scoreFuzzyMatch(titleQ, [b.title, b.author || '', b.bookNumber]),
-      }))
-      .filter((item) => item.score > 0)
-      .sort((a, b) => b.score - a.score)
-      .map((item) => item.book);
-  }, [books, bookTitleInput, confirmBookNumber, mode]);
+  }, [activeCatalogBooks, mode, activeBorrowMap]);
+
+  const deferredTitleInput = useDeferredValue(bookTitleInput);
+
+  const candidateBooks = useMemo(() => {
+    const titleQ = deferredTitleInput.trim();
+    const numQ = !isAutoFilledBookNumber ? confirmBookNumber.trim().toLowerCase() : '';
+    const base = numQ
+      ? eligibleBooks.filter((b) => b.bookNumber.toLowerCase().includes(numQ))
+      : eligibleBooks;
+    if (!titleQ) return base;
+
+    const smartMatches = smartFilterBooks(base, titleQ);
+    if (mode !== 'return') return smartMatches;
+
+    // In return mode, also allow matching by active borrower name/group in addition to title/author/number
+    const qCanon = transliterateToLatinCanonical(titleQ);
+    if (!qCanon) return smartMatches;
+    const seen = new Set(smartMatches.map((b) => b.id));
+    const borrowerMatches: Book[] = [];
+    for (const b of base) {
+      if (seen.has(b.id)) continue;
+      const summary = activeBorrowMap.get(b.id);
+      const names = [
+        b.currentBorrowerName || '',
+        b.currentBorrowerGroup || '',
+        ...(summary?.borrowers.map((x) => `${x.fullName} ${x.group}`) || []),
+      ].join(' ');
+      if (names && transliterateToLatinCanonical(names).includes(qCanon)) {
+        borrowerMatches.push(b);
+      }
+    }
+    return borrowerMatches.length > 0 ? [...smartMatches, ...borrowerMatches] : smartMatches;
+  }, [eligibleBooks, deferredTitleInput, confirmBookNumber, isAutoFilledBookNumber, mode, activeBorrowMap]);
+
+  // In return mode, when typing a title, also surface matching catalog books that aren't currently borrowed
+  // so typing feels just like main search and clearly explains availability status.
+  const catalogHintBooks = useMemo(() => {
+    if (mode !== 'return' || selectedBookId) return [];
+    const titleQ = deferredTitleInput.trim();
+    if (titleQ.length < 2) return [];
+    if (candidateBooks.length >= 12) return [];
+    const candidateIds = new Set(candidateBooks.map((b) => b.id));
+    return smartFilterBooks(activeCatalogBooks, titleQ)
+      .filter((b) => !candidateIds.has(b.id))
+      .slice(0, 15);
+  }, [mode, selectedBookId, deferredTitleInput, candidateBooks, activeCatalogBooks]);
 
   const selectedBook = useMemo(
     () => books.find((b) => b.id === selectedBookId) || null,
@@ -152,37 +271,43 @@ export function BorrowReturnModal({
   const resolveBookForSubmit = useCallback((): Book | null => {
     if (selectedBook) return selectedBook;
     const titleQ = normalizeCompareText(bookTitleInput);
+    const titleCanon = transliterateToLatinCanonical(bookTitleInput);
+    const titleRel = toRelaxedPhonetic(titleCanon);
     const numQ = normalizeCompareText(confirmBookNumber);
 
+    const titlesMatch = (bTitle: string): boolean => {
+      if (normalizeCompareText(bTitle) === titleQ) return true;
+      const bCanon = transliterateToLatinCanonical(bTitle);
+      if (titleCanon && bCanon === titleCanon) return true;
+      return Boolean(titleRel && toRelaxedPhonetic(bCanon) === titleRel);
+    };
+
     const byNumAndTitle = candidateBooks.find(
-      (b) =>
-        normalizeCompareText(b.bookNumber) === numQ &&
-        normalizeCompareText(b.title) === titleQ
+      (b) => normalizeCompareText(b.bookNumber) === numQ && titlesMatch(b.title)
     );
     if (byNumAndTitle) return byNumAndTitle;
 
     if (numQ) {
       const byNum = books.find((b) => {
-        if (!b.isActive) return false;
+        if (!b.isActive || b.isDeleted) return false;
         const avail = getBookAvailableCount(b);
         const totalQty = Math.max(1, b.quantity || 1);
-        const eligible = mode === 'borrow' ? avail > 0 : avail < totalQty;
+        const eligible =
+          mode === 'borrow' ? avail > 0 : avail < totalQty || activeBorrowMap.has(b.id);
         return eligible && normalizeCompareText(b.bookNumber) === numQ;
       });
       if (byNum) return byNum;
     }
 
     if (titleQ) {
-      const exactTitleMatches = candidateBooks.filter(
-        (b) => normalizeCompareText(b.title) === titleQ
-      );
+      const exactTitleMatches = candidateBooks.filter((b) => titlesMatch(b.title));
       if (exactTitleMatches.length === 1) {
         return exactTitleMatches[0];
       }
     }
 
     return null;
-  }, [selectedBook, bookTitleInput, confirmBookNumber, candidateBooks, books, mode]);
+  }, [selectedBook, bookTitleInput, confirmBookNumber, candidateBooks, books, mode, activeBorrowMap]);
 
   // Borrow mode: auto-recall permanently saved Face ID when firstName + lastName match
   useEffect(() => {
@@ -228,6 +353,7 @@ export function BorrowReturnModal({
     setVerifiedFaceState(null);
     setReturnTargetFace(null);
     setLegacyNoFaceProfile(false);
+    setRequiresExtraBookNumber(false);
 
     const targetBook = resolveBookForSubmit();
     const f = firstName.trim();
@@ -252,6 +378,7 @@ export function BorrowReturnModal({
         if (res.borrowFound) {
           setReturnTargetFace(res.faceProfile);
           setLegacyNoFaceProfile(!res.requiresFaceVerification);
+          setRequiresExtraBookNumber(res.requiresExtraBookNumber);
         }
       } catch {
         // Ignore transient lookup error; submit/button click handles it
@@ -273,14 +400,33 @@ export function BorrowReturnModal({
   const handleSelectBook = (book: Book) => {
     setSelectedBookId(book.id);
     setBookTitleInput(book.title);
-    if (!isBorrow) {
-      setConfirmBookNumber(book.bookNumber);
-    }
+    setConfirmBookNumber(book.bookNumber);
+    setIsAutoFilledBookNumber(true);
     setErrorMsg(null);
   };
 
+  const handleBookTitleChange = (val: string) => {
+    setBookTitleInput(val);
+    if (selectedBook && val !== selectedBook.title) {
+      setSelectedBookId('');
+      if (isAutoFilledBookNumber) {
+        setConfirmBookNumber('');
+        setIsAutoFilledBookNumber(false);
+      }
+    }
+    const matched = findUniqueExactTitleMatch(eligibleBooks, val);
+    if (matched) {
+      setSelectedBookId(matched.id);
+      setConfirmBookNumber(matched.bookNumber);
+      setIsAutoFilledBookNumber(true);
+    } else if (!selectedBook && isAutoFilledBookNumber) {
+      setConfirmBookNumber('');
+      setIsAutoFilledBookNumber(false);
+    }
+  };
+
   const isNetworkFailure = (err: unknown): boolean => {
-    if (!navigator.onLine) return true;
+    if (!navigator.onLine || isQuotaExceededError(err)) return true;
     const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
     return (
       msg.includes('offline') ||
@@ -326,6 +472,7 @@ export function BorrowReturnModal({
     }
     setReturnTargetFace(res.faceProfile);
     setLegacyNoFaceProfile(!res.requiresFaceVerification);
+    setRequiresExtraBookNumber(res.requiresExtraBookNumber);
     return {
       faceProfile: res.faceProfile,
       legacyNoFace: !res.requiresFaceVerification,
@@ -356,7 +503,7 @@ export function BorrowReturnModal({
       return;
     }
 
-    const effectiveBookNumber = confirmBookNumber.trim() || (!isBorrow ? targetBook.bookNumber : '');
+    const effectiveBookNumber = confirmBookNumber.trim() || targetBook.bookNumber;
     if (!effectiveBookNumber) {
       setErrorMsg('Olinayotgan kitobning maxsus inventar raqamini kiriting.');
       return;
@@ -374,21 +521,36 @@ export function BorrowReturnModal({
     const inputTitleNorm = normalizeCompareText(bookTitleInput);
     const targetTitleNorm = normalizeCompareText(targetBook.title);
     if (isBorrow) {
-      if (inputTitleNorm !== targetTitleNorm) {
+      if (!titlesMatchCrossScript(bookTitleInput, targetBook.title)) {
         setErrorMsg(
           `Kiritilgan kitob nomi (${bookTitleInput}) tanlangan kitob nomi («${targetBook.title}») bilan mos kelmadi.`
         );
         return;
       }
-    } else if (inputTitleNorm && !targetTitleNorm.includes(inputTitleNorm)) {
-      setErrorMsg(
-        `Kiritilgan kitob nomi («${bookTitleInput}») tanlangan kitob nomi («${targetBook.title}») bilan mos kelmadi.`
-      );
-      return;
+    } else if (inputTitleNorm) {
+      const targetCanon = transliterateToLatinCanonical(targetBook.title);
+      const inputCanon = transliterateToLatinCanonical(bookTitleInput);
+      const matchesSub =
+        targetTitleNorm.includes(inputTitleNorm) ||
+        (inputCanon.length > 0 && targetCanon.includes(inputCanon)) ||
+        (inputCanon.length > 0 &&
+          toRelaxedPhonetic(targetCanon).includes(toRelaxedPhonetic(inputCanon)));
+      if (!matchesSub) {
+        setErrorMsg(
+          `Kiritilgan kitob nomi («${bookTitleInput}») tanlangan kitob nomi («${targetBook.title}») bilan mos kelmadi.`
+        );
+        return;
+      }
     }
 
     if (!firstName.trim() || !lastName.trim() || !group.trim() || !course.trim()) {
       setErrorMsg('Ism, familiya, guruh va kurs ma’lumotlarini to‘liq kiriting.');
+      return;
+    }
+    if (!isBorrow && !useAdminOverride && requiresExtraBookNumber && !extraBookNumber.trim()) {
+      setErrorMsg(
+        'Ushbu kitobni olayotganda qo‘shimcha kitob raqami kiritilgan. Topshirish uchun o‘sha qo‘shimcha raqamni kiritish majburiy!'
+      );
       return;
     }
     if (isBorrow && !savedFaceProfile && !capturedFaceEnrollment) {
@@ -415,6 +577,8 @@ export function BorrowReturnModal({
     );
     const returnedAtIso = buildReturnIso(returnDateStr);
 
+    const cleanExtraBookNumber = extraBookNumber.trim().slice(0, 64);
+
     if (!navigator.onLine) {
       const nextQ = enqueueOfflineAction({
         id: makeSafeDocId('offline'),
@@ -423,6 +587,7 @@ export function BorrowReturnModal({
         payload: {
           bookId: targetBook.id,
           bookNumber: targetBook.bookNumber,
+          ...(cleanExtraBookNumber ? { extraBookNumber: cleanExtraBookNumber } : {}),
           bookTitle: targetBook.title,
           firstName: firstName.trim(),
           lastName: lastName.trim(),
@@ -468,6 +633,7 @@ export function BorrowReturnModal({
         const res = await borrowBookAtomic({
           bookId: targetBook.id,
           bookNumber: targetBook.bookNumber,
+          extraBookNumber: cleanExtraBookNumber || undefined,
           firstName,
           lastName,
           group,
@@ -483,6 +649,7 @@ export function BorrowReturnModal({
           action: 'borrow',
           bookTitle: targetBook.title,
           bookNumber: targetBook.bookNumber,
+          ...(cleanExtraBookNumber ? { extraBookNumber: cleanExtraBookNumber } : {}),
           studentName: `${firstName.trim()} ${lastName.trim()}`,
           group: group.trim(),
           course: course.trim(),
@@ -494,6 +661,7 @@ export function BorrowReturnModal({
         const res = await returnBookAtomic({
           bookId: targetBook.id,
           bookNumber: effectiveBookNumber,
+          extraBookNumber: cleanExtraBookNumber || undefined,
           bookTitle: bookTitleInput.trim() || targetBook.title,
           firstName,
           lastName,
@@ -508,6 +676,7 @@ export function BorrowReturnModal({
           action: 'return',
           bookTitle: targetBook.title,
           bookNumber: targetBook.bookNumber,
+          ...(cleanExtraBookNumber ? { extraBookNumber: cleanExtraBookNumber } : {}),
           studentName: `${firstName.trim()} ${lastName.trim()}`,
           group: group.trim(),
           course: course.trim(),
@@ -524,6 +693,7 @@ export function BorrowReturnModal({
           payload: {
             bookId: targetBook.id,
             bookNumber: targetBook.bookNumber,
+            ...(cleanExtraBookNumber ? { extraBookNumber: cleanExtraBookNumber } : {}),
             bookTitle: targetBook.title,
             firstName: firstName.trim(),
             lastName: lastName.trim(),
@@ -548,7 +718,7 @@ export function BorrowReturnModal({
         });
         onOfflineQueued(nextQ);
         setOfflineNotice(
-          'Server bilan aloqa uzildi. Operatsiya muvaffaqiyatli deb tasdiqlanmadi va keyinroq yuborish uchun saqlandi.'
+          'Server bilan aloqa uzildi yoki kunlik limit vaqtincha to‘ldi. Operatsiya yo‘qolmasligi uchun mahalliy navbatga saqlandi va keyinroq avtomatik yuboriladi.'
         );
       } else {
         setErrorMsg(
@@ -561,9 +731,9 @@ export function BorrowReturnModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-950/60 flex items-center justify-center p-3 sm:p-5 overflow-y-auto">
+    <div className="fixed inset-0 z-50 bg-slate-950/60 flex items-start sm:items-center justify-center p-2.5 sm:p-5 overflow-y-auto">
       <div className="w-full max-w-3xl rounded-2xl bg-white border border-slate-200 shadow-2xl overflow-hidden my-auto">
-        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200 bg-slate-50/70">
+        <div className="flex items-center justify-between px-5 sm:px-6 py-4 border-b border-slate-200 bg-slate-50/70">
           <div>
             <h2 className="font-display text-xl font-bold text-slate-900">
               {isBorrow ? 'Kitob olish rasmiylashtiruvi' : 'Kitob topshirish rasmiylashtiruvi'}
@@ -577,7 +747,7 @@ export function BorrowReturnModal({
           <button
             type="button"
             onClick={onClose}
-            className="w-10 h-10 rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-200/70 hover:text-slate-900 transition-colors"
+            className="w-10 h-10 rounded-xl flex items-center justify-center text-slate-500 hover:bg-slate-200/70 hover:text-slate-900 transition-colors shrink-0"
             aria-label="Yopish"
           >
             <X className="w-5 h-5" />
@@ -606,6 +776,11 @@ export function BorrowReturnModal({
                 <span className="font-semibold text-slate-900">
                   {receipt.bookTitle} (№ {receipt.bookNumber})
                 </span>
+                {receipt.extraBookNumber && (
+                  <span className="text-xs font-mono text-amber-800 block mt-0.5">
+                    Qo‘shimcha raqami: {receipt.extraBookNumber}
+                  </span>
+                )}
               </div>
               <div>
                 <span className="text-xs text-slate-500 block">O‘quvchi F.I.Sh.</span>
@@ -652,7 +827,7 @@ export function BorrowReturnModal({
             </div>
           </div>
         ) : (
-          <form onSubmit={handleSubmit} className="p-6 space-y-6 max-h-[82vh] overflow-y-auto">
+          <form onSubmit={handleSubmit} className="p-5 sm:p-6 space-y-6 max-h-[85dvh] overflow-y-auto">
             {offlineNotice && (
               <div className="rounded-xl border border-amber-300 bg-amber-50 p-4 flex items-start gap-3 text-sm text-amber-900">
                 <WifiOff className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
@@ -683,6 +858,7 @@ export function BorrowReturnModal({
                       setSelectedBookId('');
                       setBookTitleInput('');
                       setConfirmBookNumber('');
+                      setIsAutoFilledBookNumber(false);
                     }}
                     className="text-xs font-semibold text-blue-700 hover:underline"
                   >
@@ -694,45 +870,70 @@ export function BorrowReturnModal({
               <div className="grid grid-cols-1 sm:grid-cols-[1fr_190px] gap-3">
                 <div>
                   <label className="block text-xs font-medium text-slate-600 mb-1">
-                    Kitob nomi {isBorrow ? '*' : '(yoki pastdan tanlang)'}
+                    Kitob nomi {isBorrow ? '*' : '(qidirish va tanlash uchun yozing)'}
                   </label>
-                  <input
-                    type="text"
-                    required={isBorrow}
-                    value={bookTitleInput}
-                    onChange={(e) => {
-                      setBookTitleInput(e.target.value);
-                      if (selectedBook && e.target.value !== selectedBook.title) {
-                        setSelectedBookId('');
+                  <div className="relative">
+                    <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      type="text"
+                      autoComplete="off"
+                      required={isBorrow}
+                      value={bookTitleInput}
+                      onChange={(e) => handleBookTitleChange(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !selectedBook && candidateBooks.length > 0) {
+                          e.preventDefault();
+                          handleSelectBook(candidateBooks[0]);
+                        }
+                      }}
+                      placeholder={
+                        isBorrow
+                          ? 'Kitob nomi, muallif yoki raqamni yozing...'
+                          : 'Topshirilayotgan kitob nomini yozing (lotin/kirill)...'
                       }
-                    }}
-                    placeholder={
-                      isBorrow
-                        ? 'Masalan: O‘zbekiston tarixi'
-                        : 'Topshirilayotgan kitob nomini yozing...'
-                    }
-                    className="w-full min-h-[44px] px-3.5 py-2 text-sm rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-600"
-                  />
+                      className="w-full min-h-[44px] pl-10 pr-9 py-2 text-sm rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                    />
+                    {bookTitleInput && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedBookId('');
+                          setBookTitleInput('');
+                          setConfirmBookNumber('');
+                          setIsAutoFilledBookNumber(false);
+                        }}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 w-6 h-6 rounded-md flex items-center justify-center text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                        aria-label="Qidiruvni tozalash"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div>
                   <label className="block text-xs font-medium text-slate-600 mb-1">
-                    Kitob raqami {isBorrow ? '*' : '(avto/qo‘lda)'}
+                    Kitob raqami * (avtomatik)
                   </label>
                   <input
                     type="text"
                     required={isBorrow}
                     value={confirmBookNumber}
-                    onChange={(e) => setConfirmBookNumber(e.target.value)}
+                    onChange={(e) => {
+                      setConfirmBookNumber(e.target.value);
+                      setIsAutoFilledBookNumber(false);
+                    }}
                     placeholder="Masalan: 001"
                     className="w-full min-h-[44px] px-3.5 py-2 text-sm font-mono rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-600"
                   />
                 </div>
               </div>
 
+              {/* Instant search results / selected book right beneath Book Name */}
               {selectedBook ? (
                 <div className="rounded-xl border border-blue-200 bg-blue-50/50 p-3 flex items-center gap-3.5">
                   <div className="w-12 h-16 rounded-lg overflow-hidden border border-slate-200 shrink-0">
                     <BookCoverImage
+                      compact
                       coverUrl={selectedBook.coverUrl}
                       title={selectedBook.title}
                       bookNumber={selectedBook.bookNumber}
@@ -741,63 +942,192 @@ export function BorrowReturnModal({
                   </div>
                   <div className="min-w-0 flex-1">
                     <span className="text-xs font-mono text-blue-800 font-semibold tabular-nums">
-                      Tanlangan kitob · № {selectedBook.bookNumber} · {getBookAvailableCount(selectedBook)}/{Math.max(1, selectedBook.quantity || 1)} mavjud
+                      Tanlangan kitob · № {selectedBook.bookNumber}
+                      {Math.max(1, selectedBook.quantity || 1) > 1
+                        ? ` · ${getBookAvailableCount(selectedBook)}/${Math.max(1, selectedBook.quantity || 1)} ta`
+                        : ''}
                     </span>
                     <p className="font-display font-bold text-slate-900 truncate">
                       {selectedBook.title}
                     </p>
-                    {!isBorrow && selectedBook.currentBorrowerName && (
-                      <p className="text-xs text-amber-800 mt-0.5">
-                        Oxirgi olgan: {selectedBook.currentBorrowerName} (
-                        {selectedBook.currentBorrowerGroup})
-                      </p>
-                    )}
+                    {!isBorrow &&
+                      (selectedBook.currentBorrowerName ||
+                        (activeBorrowMap.get(selectedBook.id)?.borrowers.length || 0) > 0) && (
+                        <p className="text-xs text-amber-800 mt-0.5 truncate">
+                          Olgan:{' '}
+                          {activeBorrowMap.get(selectedBook.id)?.borrowers[0]?.fullName ||
+                            selectedBook.currentBorrowerName}{' '}
+                          (
+                          {activeBorrowMap.get(selectedBook.id)?.borrowers[0]?.group ||
+                            selectedBook.currentBorrowerGroup}
+                          )
+                        </p>
+                      )}
                   </div>
                 </div>
-              ) : candidateBooks.length === 0 ? (
-                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3.5 text-xs text-slate-500 text-center">
-                  {isBorrow
-                    ? 'Mos keladigan mavjud kitob topilmadi.'
-                    : 'Mos keladigan olingan kitob topilmadi.'}
-                </div>
               ) : (
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-40 overflow-y-auto pr-1">
-                  {candidateBooks.map((book) => {
-                    const avail = getBookAvailableCount(book);
-                    const totalQty = Math.max(1, book.quantity || 1);
-                    return (
-                      <button
-                        key={book.id}
-                        type="button"
-                        onClick={() => handleSelectBook(book)}
-                        className="text-left p-2.5 rounded-xl border border-slate-200 hover:border-blue-500 hover:bg-blue-50/40 transition-colors flex items-center gap-3"
-                      >
-                        <div className="w-9 h-12 rounded-md overflow-hidden border border-slate-200 shrink-0">
-                          <BookCoverImage
-                            coverUrl={book.coverUrl}
-                            title={book.title}
-                            bookNumber={book.bookNumber}
-                            className="w-full h-full"
-                          />
-                        </div>
-                        <div className="min-w-0">
-                          <span className="text-xs font-mono font-semibold text-blue-700 tabular-nums">
-                            № {book.bookNumber} · {avail}/{totalQty} ta
-                          </span>
-                          <p className="text-xs sm:text-sm font-semibold text-slate-900 truncate">
-                            {book.title}
-                          </p>
-                          {!isBorrow && book.currentBorrowerName && (
-                            <p className="text-[11px] text-slate-500 truncate">
-                              {book.currentBorrowerName}
-                            </p>
-                          )}
-                        </div>
-                      </button>
-                    );
-                  })}
+                <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-2.5 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2 px-1 text-xs">
+                    <span className="font-semibold text-slate-700 inline-flex items-center gap-1.5">
+                      <Search className="w-3.5 h-3.5 text-blue-600" />
+                      {isBorrow
+                        ? `Mavjud kitoblar (${candidateBooks.length} ta)`
+                        : `Topshirish mumkin bo‘lgan olingan kitoblar (${candidateBooks.length} ta)`}
+                    </span>
+                    {!isBorrow && isLoadingActiveBorrows && (
+                      <span className="text-[11px] text-slate-500">Yangilanmoqda...</span>
+                    )}
+                  </div>
+
+                  {candidateBooks.length > 0 ? (
+                    <div className="space-y-1.5">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-56 overflow-y-auto pr-1">
+                        {candidateBooks.slice(0, 50).map((book) => {
+                          const avail = getBookAvailableCount(book);
+                          const totalQty = Math.max(1, book.quantity || 1);
+                          const summary = activeBorrowMap.get(book.id);
+                          const holderLabel =
+                            summary?.borrowers[0]?.fullName || book.currentBorrowerName;
+                          const holderGroup =
+                            summary?.borrowers[0]?.group || book.currentBorrowerGroup;
+                          return (
+                            <button
+                              key={book.id}
+                              type="button"
+                              onClick={() => handleSelectBook(book)}
+                              className="text-left p-2.5 rounded-xl border border-slate-200 bg-white hover:border-blue-500 hover:bg-blue-50/40 transition-colors flex items-center gap-3"
+                            >
+                              <div className="w-9 h-12 rounded-md overflow-hidden border border-slate-200 shrink-0">
+                                <BookCoverImage
+                                  compact
+                                  coverUrl={book.coverUrl}
+                                  title={book.title}
+                                  bookNumber={book.bookNumber}
+                                  className="w-full h-full"
+                                />
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center justify-between gap-1.5">
+                                  <span className="text-xs font-mono font-semibold text-blue-700 tabular-nums truncate">
+                                    № {book.bookNumber}
+                                    {totalQty > 1 ? ` · ${avail}/${totalQty} ta` : ''}
+                                  </span>
+                                  {!isBorrow && (
+                                    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 shrink-0">
+                                      Olingan
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="text-xs sm:text-sm font-semibold text-slate-900 truncate">
+                                  {book.title}
+                                </p>
+                                {book.author && (
+                                  <p className="text-[11px] text-slate-500 truncate">
+                                    {book.author}
+                                  </p>
+                                )}
+                                {!isBorrow && holderLabel && (
+                                  <p className="text-[11px] text-amber-800 truncate">
+                                    Olgan: {holderLabel}
+                                    {holderGroup ? ` (${holderGroup})` : ''}
+                                  </p>
+                                )}
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {candidateBooks.length > 50 && (
+                        <p className="text-[11px] text-slate-500 px-1 tabular-nums">
+                          Jami {candidateBooks.length} ta kitobdan birinchi 50 tasi ko‘rsatilmoqda — aniqroq topish uchun nom yoki raqam yozing.
+                        </p>
+                      )}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-slate-500 text-center py-2">
+                      {isBorrow
+                        ? 'Mos keladigan mavjud kitob topilmadi.'
+                        : bookTitleInput.trim()
+                          ? 'Kiritilgan so‘rov bo‘yicha olingan kitob topilmadi.'
+                          : 'Hozirda olingan kitoblar ro‘yxati bo‘sh.'}
+                    </p>
+                  )}
+
+                  {!isBorrow && catalogHintBooks.length > 0 && (
+                    <div className="pt-2 border-t border-slate-200 space-y-1.5">
+                      <p className="text-[11px] font-medium text-slate-500 px-1">
+                        Katalogdagi mos kitoblar (hozir barcha nusxalari kutubxonada — olinmagan):
+                      </p>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-36 overflow-y-auto pr-1">
+                        {catalogHintBooks.map((book) => (
+                          <div
+                            key={book.id}
+                            className="p-2 rounded-lg border border-slate-200 bg-slate-100/70 flex items-center gap-2.5 opacity-80"
+                          >
+                            <div className="w-8 h-10 rounded overflow-hidden border border-slate-200 shrink-0">
+                              <BookCoverImage
+                                compact
+                                coverUrl={book.coverUrl}
+                                title={book.title}
+                                bookNumber={book.bookNumber}
+                                className="w-full h-full"
+                              />
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center justify-between gap-1">
+                                <span className="text-[11px] font-mono font-semibold text-slate-600 tabular-nums">
+                                  № {book.bookNumber}
+                                </span>
+                                <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 shrink-0">
+                                  Kutubxonada
+                                </span>
+                              </div>
+                              <p className="text-xs font-semibold text-slate-700 truncate">
+                                {book.title}
+                              </p>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
+
+              {/* Extra Book Number / Alternate Book Name */}
+              <div>
+                <label className="block text-xs font-medium text-slate-600 mb-1">
+                  Qo‘shimcha kitob raqami{' '}
+                  {isBorrow ? (
+                    <span className="text-slate-400">(ixtiyoriy — kitobning boshqacha nomi)</span>
+                  ) : requiresExtraBookNumber && !useAdminOverride ? (
+                    <span className="text-red-600 font-semibold">
+                      * (Olganda kiritilgan — to‘g‘ri kiritish majburiy)
+                    </span>
+                  ) : (
+                    <span className="text-slate-400">
+                      (olayotganda kiritilgan bo‘lsa majburiy)
+                    </span>
+                  )}
+                </label>
+                <input
+                  type="text"
+                  maxLength={64}
+                  required={!isBorrow && !useAdminOverride && requiresExtraBookNumber}
+                  value={extraBookNumber}
+                  onChange={(e) => setExtraBookNumber(e.target.value)}
+                  placeholder={
+                    isBorrow
+                      ? 'Kitobning boshqacha nomi yoki qo‘shimcha raqami (majburiy emas)'
+                      : 'Olayotganda qo‘shimcha raqam yoki boshqacha nom kiritilgan bo‘lsa, aynan o‘shani kiriting'
+                  }
+                  className={`w-full min-h-[44px] px-3.5 py-2 text-sm rounded-xl border focus:outline-none focus:ring-2 ${
+                    !isBorrow && requiresExtraBookNumber && !useAdminOverride
+                      ? 'border-amber-400 bg-amber-50/40 focus:ring-amber-500'
+                      : 'border-slate-300 focus:ring-blue-600'
+                  }`}
+                />
+              </div>
             </div>
 
             {/* Step 2: Student Fields */}

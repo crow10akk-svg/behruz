@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import { AlertCircle, Camera, CheckCircle2, ShieldCheck, Upload } from 'lucide-react';
+import { AlertCircle, Camera, CheckCircle2, ShieldCheck, SwitchCamera, Upload } from 'lucide-react';
 import { compressFileToDataUrl } from '../lib/imageUtils.ts';
 import { submitQrUploadPhoto } from '../lib/libraryService.ts';
 
@@ -8,7 +8,8 @@ interface QrMobileUploadPageProps {
 }
 
 export function QrMobileUploadPage({ sessionId }: QrMobileUploadPageProps) {
-  const cameraInputRef = useRef<HTMLInputElement | null>(null);
+  const rearCameraInputRef = useRef<HTMLInputElement | null>(null);
+  const frontCameraInputRef = useRef<HTMLInputElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [isSending, setIsSending] = useState(false);
@@ -46,7 +47,7 @@ export function QrMobileUploadPage({ sessionId }: QrMobileUploadPageProps) {
           </span>
           <div>
             <p className="font-display font-bold text-sm">Smart Kutubxona</p>
-            <p className="text-[11px] text-slate-300">QR kod orqali kitob rasmini yuklash</p>
+            <p className="text-[11px] text-slate-300">QR kod orqali rasm yuklash</p>
           </div>
         </div>
 
@@ -76,25 +77,37 @@ export function QrMobileUploadPage({ sessionId }: QrMobileUploadPageProps) {
                 alt="Yuborilgan kitob rasmi"
                 className="w-40 aspect-[3/4] object-cover rounded-xl border border-slate-200 mx-auto"
               />
-              <button
-                type="button"
-                onClick={() => {
-                  setIsSent(false);
-                  cameraInputRef.current?.click();
-                }}
-                className="w-full min-h-[46px] px-4 py-2.5 text-sm font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-xl transition-colors"
-              >
-                Boshqa rasm yuborish
-              </button>
+              <div className="grid grid-cols-2 gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsSent(false);
+                    rearCameraInputRef.current?.click();
+                  }}
+                  className="min-h-[46px] px-3 py-2 text-xs sm:text-sm font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-xl transition-colors"
+                >
+                  Orqa kamera
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsSent(false);
+                    frontCameraInputRef.current?.click();
+                  }}
+                  className="min-h-[46px] px-3 py-2 text-xs sm:text-sm font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-xl transition-colors"
+                >
+                  Old kamera
+                </button>
+              </div>
             </div>
           ) : (
             <>
               <div className="space-y-1.5 text-center">
                 <h1 className="font-display text-lg font-bold text-slate-900">
-                  Kitob muqovasini rasmga oling
+                  Kamera bilan rasmga oling
                 </h1>
                 <p className="text-xs text-slate-500">
-                  Telefon kamerasi orqali kitob muqovasini suratga oling yoki galereyadan tanlang. Rasm darhol admin panelga uzatiladi.
+                  Telefonning orqa yoki old kamerasi orqali rasmga oling yoxud galereyadan tanlang. Rasm darhol admin panelga uzatiladi.
                 </p>
               </div>
 
@@ -102,11 +115,21 @@ export function QrMobileUploadPage({ sessionId }: QrMobileUploadPageProps) {
                 <button
                   type="button"
                   disabled={isSending}
-                  onClick={() => cameraInputRef.current?.click()}
+                  onClick={() => rearCameraInputRef.current?.click()}
                   className="w-full min-h-[52px] inline-flex items-center justify-center gap-2.5 px-5 py-3 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-xl transition-colors disabled:opacity-60"
                 >
                   <Camera className="w-5 h-5" />
-                  <span>{isSending ? 'Yuborilmoqda...' : 'Kamera bilan rasmga olish'}</span>
+                  <span>{isSending ? 'Yuborilmoqda...' : 'Orqa kamera bilan rasmga olish'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  disabled={isSending}
+                  onClick={() => frontCameraInputRef.current?.click()}
+                  className="w-full min-h-[50px] inline-flex items-center justify-center gap-2.5 px-5 py-2.5 text-sm font-semibold text-blue-900 bg-blue-50 border border-blue-200 hover:bg-blue-100 rounded-xl transition-colors disabled:opacity-60"
+                >
+                  <SwitchCamera className="w-5 h-5 text-blue-700" />
+                  <span>{isSending ? 'Yuborilmoqda...' : 'Old kamera bilan rasmga olish'}</span>
                 </button>
 
                 <button
@@ -123,10 +146,18 @@ export function QrMobileUploadPage({ sessionId }: QrMobileUploadPageProps) {
           )}
 
           <input
-            ref={cameraInputRef}
+            ref={rearCameraInputRef}
             type="file"
             accept="image/*"
             capture="environment"
+            onChange={handleSelectedFile}
+            className="hidden"
+          />
+          <input
+            ref={frontCameraInputRef}
+            type="file"
+            accept="image/*"
+            capture="user"
             onChange={handleSelectedFile}
             className="hidden"
           />

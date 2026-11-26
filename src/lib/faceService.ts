@@ -1,3 +1,4 @@
+import { sha256Hex } from './crypto.ts';
 import { normalizeCompareText, normalizeGroupCompare } from './imageUtils.ts';
 
 export const FACE_MATCH_THRESHOLD = 0.56;
@@ -80,11 +81,7 @@ export async function computeFaceDescriptorHash(
 ): Promise<string> {
   const normalized = descriptor.map((n) => Number(n).toFixed(5)).join(',');
   const payload = `${nameKey}|${normalized}`;
-  const encoded = new TextEncoder().encode(payload);
-  const digest = await crypto.subtle.digest('SHA-256', encoded);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
+  return sha256Hex(payload);
 }
 
 export async function verifyFaceDescriptorIntegrity(

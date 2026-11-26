@@ -6,10 +6,12 @@ import {
   RefreshCw,
   ScanFace,
   ShieldCheck,
+  SwitchCamera,
   Upload,
   UserCheck,
   AlertTriangle,
 } from 'lucide-react';
+import { openCameraStream, type CameraFacingMode } from '../lib/cameraUtils.ts';
 import {
   compareFaceDescriptors,
   computeFaceDescriptorHash,
@@ -76,8 +78,10 @@ export function FaceCaptureBox({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const frontCameraInputRef = useRef<HTMLInputElement | null>(null);
 
   const [cameraActive, setCameraActive] = useState(false);
+  const [facingMode, setFacingMode] = useState<CameraFacingMode>('user');
   const [isProcessing, setIsProcessing] = useState(false);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [mismatchPct, setMismatchPct] = useState<number | null>(null);
@@ -97,6 +101,18 @@ export function FaceCaptureBox({
     };
   }, []);
 
+  // Ensure <video> always receives the active stream after mounting on mobile browsers
+  useEffect(() => {
+    if (!cameraActive || !streamRef.current || !videoRef.current) return;
+    const video = videoRef.current;
+    if (video.srcObject !== streamRef.current) {
+      video.srcObject = streamRef.current;
+    }
+    void video.play().catch(() => {
+      // ignore autoplay restriction; playsInline + user click handles it
+    });
+  }, [cameraActive, facingMode]);
+
   // Stop camera automatically if savedProfile is auto-recalled in enroll mode or adminOverride enabled
   useEffect(() => {
     if (mode === 'enroll' && savedProfile) {
@@ -109,39 +125,40 @@ export function FaceCaptureBox({
     }
   }, [mode, savedProfile, adminOverride, legacyNoFaceProfile]);
 
-  const startCamera = async () => {
+  const startCamera = async (targetFacing: CameraFacingMode = facingMode) => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
     setStatusError(null);
     setMismatchPct(null);
     try {
-      if (!navigator.mediaDevices?.getUserMedia) {
-        throw new Error('Brauzer kamerani qo‘llab-quvvatlamaydi');
-      }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: { ideal: 'user' },
-          width: { ideal: 640 },
-          height: { ideal: 480 },
-        },
-        audio: false,
-      });
+      const stream = await openCameraStream(targetFacing, { width: 640, height: 480 });
       streamRef.current = stream;
+      setFacingMode(targetFacing);
       setCameraActive(true);
-      requestAnimationFrame(async () => {
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          try {
-            await videoRef.current.play();
-          } catch {
+      requestAnimationFrame(() => {
+        if (videoRef.current && streamRef.current) {
+          videoRef.current.srcObject = streamRef.current;
+          void videoRef.current.play().catch(() => {
             // ignore autoplay block
-          }
+          });
         }
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Kamera ruxsati berilmadi';
       setStatusError(
-        `Old kamerani yoqib bo‘lmadi (${msg}). Quyidagi tugma orqali rasm tanlashingiz mumkin.`
+        `Kamerani yoqib bo‘lmadi (${msg}). Quyidagi «Old kamera» yoki «Fayldan» tugmasi orqali rasm olishingiz mumkin.`
       );
       setCameraActive(false);
+    }
+  };
+
+  const handleToggleFacing = () => {
+    const next: CameraFacingMode = facingMode === 'user' ? 'environment' : 'user';
+    setFacingMode(next);
+    if (cameraActive) {
+      void startCamera(next);
     }
   };
 
@@ -309,9 +326,12 @@ export function FaceCaptureBox({
                 <>
                   <video
                     ref={videoRef}
+                    autoPlay
                     playsInline
                     muted
-                    className="w-full h-full object-cover scale-x-[-1]"
+                    className={`w-full h-full object-cover ${
+                      facingMode === 'user' ? 'scale-x-[-1]' : ''
+                    }`}
                   />
                   <div className="pointer-events-none absolute inset-3 rounded-[45%] border-2 border-dashed border-blue-400/80" />
                 </>
@@ -350,26 +370,37 @@ export function FaceCaptureBox({
 
               <div className="flex flex-wrap gap-2">
                 {cameraActive && !hasCaptured ? (
-                  <button
-                    type="button"
-                    disabled={isProcessing}
-                    onClick={handleCaptureFromVideo}
-                    className="inline-flex items-center gap-2 min-h-[42px] px-4 py-2 text-xs sm:text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-xl transition-colors disabled:opacity-60"
-                  >
-                    {isProcessing ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Camera className="w-4 h-4" />
-                    )}
-                    <span>{isProcessing ? 'Yuz aniqlanmoqda...' : 'Rasmga tushish (Face ID)'}</span>
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      disabled={isProcessing}
+                      onClick={handleCaptureFromVideo}
+                      className="inline-flex items-center gap-2 min-h-[42px] px-4 py-2 text-xs sm:text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-xl transition-colors disabled:opacity-60"
+                    >
+                      {isProcessing ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Camera className="w-4 h-4" />
+                      )}
+                      <span>{isProcessing ? 'Yuz aniqlanmoqda...' : 'Rasmga tushish (Face ID)'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isProcessing}
+                      onClick={handleToggleFacing}
+                      className="inline-flex items-center gap-1.5 min-h-[42px] px-3 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-100 rounded-xl transition-colors disabled:opacity-60"
+                    >
+                      <SwitchCamera className="w-4 h-4" />
+                      <span>{facingMode === 'user' ? 'Orqa kamera' : 'Old kamera'}</span>
+                    </button>
+                  </>
                 ) : (
                   <button
                     type="button"
                     disabled={isProcessing}
                     onClick={() => {
                       onCaptureEnrollment?.(null);
-                      startCamera();
+                      void startCamera(facingMode);
                     }}
                     className="inline-flex items-center gap-2 min-h-[42px] px-4 py-2 text-xs sm:text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-xl transition-colors disabled:opacity-60"
                   >
@@ -381,6 +412,16 @@ export function FaceCaptureBox({
                     <span>{hasCaptured ? 'Qayta rasmga olish' : 'Face ID kamerasini yoqish'}</span>
                   </button>
                 )}
+
+                <button
+                  type="button"
+                  disabled={isProcessing}
+                  onClick={() => frontCameraInputRef.current?.click()}
+                  className="inline-flex items-center gap-1.5 min-h-[42px] px-3.5 py-2 text-xs font-semibold text-blue-800 bg-blue-50 border border-blue-200 hover:bg-blue-100 rounded-xl transition-colors disabled:opacity-60"
+                >
+                  <Camera className="w-4 h-4" />
+                  <span>Old kamera (telefon)</span>
+                </button>
 
                 <button
                   type="button"
@@ -397,10 +438,17 @@ export function FaceCaptureBox({
         )}
 
         <input
-          ref={fileInputRef}
+          ref={frontCameraInputRef}
           type="file"
           accept="image/*"
           capture="user"
+          onChange={handleFileUpload}
+          className="hidden"
+        />
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
           onChange={handleFileUpload}
           className="hidden"
         />
@@ -476,7 +524,7 @@ export function FaceCaptureBox({
             type="button"
             onClick={() => {
               onVerifiedStateChange?.(null);
-              startCamera();
+              void startCamera(facingMode);
             }}
             className="text-xs font-semibold text-emerald-800 hover:underline"
           >
@@ -490,9 +538,12 @@ export function FaceCaptureBox({
               <>
                 <video
                   ref={videoRef}
+                  autoPlay
                   playsInline
                   muted
-                  className="w-full h-full object-cover scale-x-[-1]"
+                  className={`w-full h-full object-cover ${
+                    facingMode === 'user' ? 'scale-x-[-1]' : ''
+                  }`}
                 />
                 <div className="pointer-events-none absolute inset-3 rounded-[45%] border-2 border-dashed border-emerald-400/80" />
               </>
@@ -534,30 +585,51 @@ export function FaceCaptureBox({
 
             <div className="flex flex-wrap gap-2">
               {cameraActive ? (
-                <button
-                  type="button"
-                  disabled={isProcessing || isResolvingTarget}
-                  onClick={handleCaptureFromVideo}
-                  className="inline-flex items-center gap-2 min-h-[42px] px-4 py-2 text-xs sm:text-sm font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-xl transition-colors disabled:opacity-60"
-                >
-                  {isProcessing ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <ScanFace className="w-4 h-4" />
-                  )}
-                  <span>{isProcessing ? 'Tekshirilmoqda...' : 'Yuzni tasdiqlash (Face ID)'}</span>
-                </button>
+                <>
+                  <button
+                    type="button"
+                    disabled={isProcessing || isResolvingTarget}
+                    onClick={handleCaptureFromVideo}
+                    className="inline-flex items-center gap-2 min-h-[42px] px-4 py-2 text-xs sm:text-sm font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-xl transition-colors disabled:opacity-60"
+                  >
+                    {isProcessing ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <ScanFace className="w-4 h-4" />
+                    )}
+                    <span>{isProcessing ? 'Tekshirilmoqda...' : 'Yuzni tasdiqlash (Face ID)'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isProcessing || isResolvingTarget}
+                    onClick={handleToggleFacing}
+                    className="inline-flex items-center gap-1.5 min-h-[42px] px-3 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-100 rounded-xl transition-colors disabled:opacity-60"
+                  >
+                    <SwitchCamera className="w-4 h-4" />
+                    <span>{facingMode === 'user' ? 'Orqa kamera' : 'Old kamera'}</span>
+                  </button>
+                </>
               ) : (
                 <button
                   type="button"
                   disabled={isProcessing || isResolvingTarget}
-                  onClick={startCamera}
+                  onClick={() => void startCamera(facingMode)}
                   className="inline-flex items-center gap-2 min-h-[42px] px-4 py-2 text-xs sm:text-sm font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-xl transition-colors disabled:opacity-60"
                 >
                   <Camera className="w-4 h-4" />
                   <span>Face ID kamerasini yoqish</span>
                 </button>
               )}
+
+              <button
+                type="button"
+                disabled={isProcessing || isResolvingTarget}
+                onClick={() => frontCameraInputRef.current?.click()}
+                className="inline-flex items-center gap-1.5 min-h-[42px] px-3.5 py-2 text-xs font-semibold text-blue-800 bg-blue-50 border border-blue-200 hover:bg-blue-100 rounded-xl transition-colors disabled:opacity-60"
+              >
+                <Camera className="w-4 h-4" />
+                <span>Old kamera (telefon)</span>
+              </button>
 
               <button
                 type="button"
@@ -574,10 +646,17 @@ export function FaceCaptureBox({
       )}
 
       <input
-        ref={fileInputRef}
+        ref={frontCameraInputRef}
         type="file"
         accept="image/*"
         capture="user"
+        onChange={handleFileUpload}
+        className="hidden"
+      />
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
         onChange={handleFileUpload}
         className="hidden"
       />

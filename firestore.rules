@@ -81,7 +81,8 @@ service cloud.firestore {
         'studentFirstName', 'studentLastName', 'studentFullName',
         'studentGroup', 'studentCourse', 'type', 'status',
         'borrowedAt', 'dueDate', 'returnedAt',
-        'borrowSignatureId', 'returnSignatureId', 'faceProfileId', 'adminOverride', 'createdAt'
+        'borrowSignatureId', 'returnSignatureId', 'faceProfileId', 'extraBookNumber',
+        'adminOverride', 'createdAt'
       ])
       && data.bookId is string && data.bookId.size() >= 1 && data.bookId.size() <= 128
       && data.bookNumber is string && data.bookNumber.size() >= 1 && data.bookNumber.size() <= 32
@@ -100,6 +101,7 @@ service cloud.firestore {
       && (!('borrowSignatureId' in data) || (data.borrowSignatureId is string && data.borrowSignatureId.size() <= 128))
       && (!('returnSignatureId' in data) || (data.returnSignatureId is string && data.returnSignatureId.size() <= 128))
       && (!('faceProfileId' in data) || (data.faceProfileId is string && data.faceProfileId.size() <= 128))
+      && (!('extraBookNumber' in data) || (data.extraBookNumber is string && data.extraBookNumber.size() <= 64))
       && (!('adminOverride' in data) || data.adminOverride is bool)
       && data.createdAt is string && data.createdAt.size() <= 64;
     }

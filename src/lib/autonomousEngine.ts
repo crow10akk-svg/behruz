@@ -1,25 +1,26 @@
 import {
-  collection,
-  deleteDoc,
   doc,
-  getDocs,
   updateDoc,
 } from 'firebase/firestore';
 import { db } from './firebase.ts';
-import { getBookAvailableCount, logAdminActivityNonBlocking } from './libraryService.ts';
-import { isOverdueDate, normalizeCompareText } from './imageUtils.ts';
+import {
+  getBookAvailableCount,
+  logAdminActivityNonBlocking,
+  upsertBookDoc,
+} from './libraryService.ts';
+import {
+  isOverdueDate,
+  toRelaxedPhonetic,
+  transliterateToLatinCanonical,
+} from './imageUtils.ts';
 import type { Book, OfflinePendingAction, Student, TransactionRecord } from '../types.ts';
 
 /**
- * Pure local Uzbek-aware text normalization (apostrophe & typography invariant).
+ * Pure local Uzbek & Russian Cyrillic <-> Latin aware text normalization.
  * Runs 100% locally inside the browser — zero external AI or server dependencies.
  */
 export function normalizeUzbekFuzzy(text: string): string {
-  return normalizeCompareText(text)
-    .replace(/['ʻʼ`ʹ′]/g, '')
-    .replace(/[^a-z0-9.\-\s]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return transliterateToLatinCanonical(text);
 }
 
 function boundedLevenshtein(a: string, b: string, maxDist = 2): number {
@@ -51,79 +52,303 @@ function boundedLevenshtein(a: string, b: string, maxDist = 2): number {
   return prev[lb];
 }
 
+function scoreNormalizedField(
+  q: string,
+  qRel: string,
+  qTokens: string[],
+  qRelTokens: string[],
+  f: string,
+  fRel: string,
+  fWords: string[],
+  fRelWords: string[]
+): number {
+  if (!f) return 0;
+
+  if (f === q) return 100;
+  if (f.startsWith(q)) return 92;
+  if (f.includes(q)) return 84;
+
+  if (qRel && fRel) {
+    if (fRel === qRel) return 95;
+    if (fRel.startsWith(qRel)) return 88;
+    if (fRel.includes(qRel)) return 78;
+  }
+
+  let matchedTokens = 0;
+  let tokenScoreSum = 0;
+
+  for (let ti = 0; ti < qTokens.length; ti++) {
+    const qt = qTokens[ti];
+    const qrt = qRelTokens[ti] || qt;
+    let tokenBest = 0;
+
+    for (let wi = 0; wi < fWords.length; wi++) {
+      const fw = fWords[wi];
+      const fwr = fRelWords[wi] || fw;
+      if (fw === qt) {
+        tokenBest = 1;
+        break;
+      }
+      if (fwr === qrt) {
+        tokenBest = Math.max(tokenBest, 0.94);
+        continue;
+      }
+      if (fw.startsWith(qt) || fw.includes(qt)) {
+        tokenBest = Math.max(tokenBest, 0.86);
+      } else if (fwr.startsWith(qrt) || fwr.includes(qrt)) {
+        tokenBest = Math.max(tokenBest, 0.8);
+      } else if (qrt.length >= 4 && fwr.length >= 4) {
+        const allowed = qrt.length >= 7 ? 2 : 1;
+        const dist = boundedLevenshtein(qrt, fwr, allowed);
+        if (dist <= allowed) {
+          tokenBest = Math.max(tokenBest, dist === 1 ? 0.72 : 0.58);
+        }
+      }
+    }
+
+    if (tokenBest === 0) return 0;
+    matchedTokens += 1;
+    tokenScoreSum += tokenBest;
+  }
+
+  if (matchedTokens === qTokens.length && qTokens.length > 0) {
+    return Math.round((tokenScoreSum / qTokens.length) * 70);
+  }
+  return 0;
+}
+
 export function scoreFuzzyMatch(rawQuery: string, fields: string[]): number {
   const q = normalizeUzbekFuzzy(rawQuery);
   if (!q) return 1;
 
+  const qRel = toRelaxedPhonetic(q);
   const qTokens = q.split(' ').filter(Boolean);
+  const qRelTokens = qRel.split(' ').filter(Boolean);
   let bestScore = 0;
 
   for (const field of fields) {
     if (!field) continue;
     const f = normalizeUzbekFuzzy(field);
     if (!f) continue;
-
-    if (f === q) return 100;
-    if (f.startsWith(q)) {
-      bestScore = Math.max(bestScore, 90);
-      continue;
-    }
-    if (f.includes(q)) {
-      bestScore = Math.max(bestScore, 80);
-      continue;
-    }
-
+    const fRel = toRelaxedPhonetic(f);
     const fWords = f.split(' ').filter(Boolean);
-    let matchedTokens = 0;
-    let tokenScoreSum = 0;
+    const fRelWords = fRel.split(' ').filter(Boolean);
 
-    for (const qt of qTokens) {
-      let tokenBest = 0;
-      for (const fw of fWords) {
-        if (fw === qt) {
-          tokenBest = 1;
-          break;
-        }
-        if (fw.startsWith(qt) || fw.includes(qt)) {
-          tokenBest = Math.max(tokenBest, 0.85);
-        } else if (qt.length >= 4 && fw.length >= 4) {
-          const allowed = qt.length >= 7 ? 2 : 1;
-          const dist = boundedLevenshtein(qt, fw, allowed);
-          if (dist <= allowed) {
-            tokenBest = Math.max(tokenBest, dist === 1 ? 0.72 : 0.58);
-          }
-        }
-      }
-      if (tokenBest > 0) {
-        matchedTokens += 1;
-        tokenScoreSum += tokenBest;
-      }
-    }
-
-    if (matchedTokens === qTokens.length && qTokens.length > 0) {
-      bestScore = Math.max(bestScore, Math.round((tokenScoreSum / qTokens.length) * 70));
-    }
+    const score = scoreNormalizedField(
+      q,
+      qRel,
+      qTokens,
+      qRelTokens,
+      f,
+      fRel,
+      fWords,
+      fRelWords
+    );
+    if (score >= 100) return 100;
+    if (score > bestScore) bestScore = score;
   }
 
   return bestScore;
 }
 
+interface IndexedEntityText {
+  canonJoined: string;
+  relJoined: string;
+  canonWords: string[];
+  relWords: string[];
+}
+
+const entityTextCache = new WeakMap<object, IndexedEntityText>();
+
+function getIndexedEntityText(obj: object, fields: string[]): IndexedEntityText {
+  const cached = entityTextCache.get(obj);
+  if (cached) return cached;
+  const canonJoined = normalizeUzbekFuzzy(fields.filter(Boolean).join(' '));
+  const relJoined = toRelaxedPhonetic(canonJoined);
+  const entry: IndexedEntityText = {
+    canonJoined,
+    relJoined,
+    canonWords: canonJoined.split(' ').filter(Boolean),
+    relWords: relJoined.split(' ').filter(Boolean),
+  };
+  entityTextCache.set(obj, entry);
+  return entry;
+}
+
+export function matchesCachedRecordQuery(
+  record: object,
+  fields: string[],
+  rawQuery: string
+): boolean {
+  const q = normalizeUzbekFuzzy(rawQuery);
+  if (!q) return true;
+  const idx = getIndexedEntityText(record, fields);
+  if (!idx.canonJoined) return false;
+  if (idx.canonJoined.includes(q)) return true;
+
+  const qRel = toRelaxedPhonetic(q);
+  if (qRel && idx.relJoined.includes(qRel)) return true;
+
+  const qTokens = q.split(' ').filter(Boolean);
+  const qRelTokens = qRel.split(' ').filter(Boolean);
+  return (
+    scoreNormalizedField(
+      q,
+      qRel,
+      qTokens,
+      qRelTokens,
+      idx.canonJoined,
+      idx.relJoined,
+      idx.canonWords,
+      idx.relWords
+    ) > 0
+  );
+}
+
+interface IndexedBookSearch {
+  canonNum: string;
+  canonTitle: string;
+  canonAuthor: string;
+  canonCategory: string;
+  relNum: string;
+  relTitle: string;
+  relAuthor: string;
+  relCategory: string;
+  canonCombined: string;
+  relCombined: string;
+  canonWords: string[];
+  relWords: string[];
+}
+
+const bookSearchIndexCache = new WeakMap<Book, IndexedBookSearch>();
+
+function getIndexedBookSearch(b: Book): IndexedBookSearch {
+  const cached = bookSearchIndexCache.get(b);
+  if (cached) return cached;
+
+  const canonNum = normalizeUzbekFuzzy(b.bookNumber || '');
+  const canonTitle = normalizeUzbekFuzzy(b.title || '');
+  const canonAuthor = normalizeUzbekFuzzy(b.author || '');
+  const canonCategory = normalizeUzbekFuzzy(b.category || '');
+
+  const relNum = toRelaxedPhonetic(canonNum);
+  const relTitle = toRelaxedPhonetic(canonTitle);
+  const relAuthor = toRelaxedPhonetic(canonAuthor);
+  const relCategory = toRelaxedPhonetic(canonCategory);
+
+  const canonCombined = `${canonNum} ${canonTitle} ${canonAuthor} ${canonCategory}`.trim();
+  const relCombined = `${relNum} ${relTitle} ${relAuthor} ${relCategory}`.trim();
+
+  const entry: IndexedBookSearch = {
+    canonNum,
+    canonTitle,
+    canonAuthor,
+    canonCategory,
+    relNum,
+    relTitle,
+    relAuthor,
+    relCategory,
+    canonCombined,
+    relCombined,
+    canonWords: canonCombined.split(' ').filter(Boolean),
+    relWords: relCombined.split(' ').filter(Boolean),
+  };
+  bookSearchIndexCache.set(b, entry);
+  return entry;
+}
+
 export function smartFilterBooks(books: Book[], queryStr: string): Book[] {
-  const trimmed = queryStr.trim();
-  if (!trimmed) return books;
+  const q = normalizeUzbekFuzzy(queryStr);
+  if (!q) return books;
+
+  const qRel = toRelaxedPhonetic(q);
+  const qTokens = q.split(' ').filter(Boolean);
+  const qRelTokens = qRel.split(' ').filter(Boolean);
+  const allowFuzzyTypo = qRelTokens.some((t) => t.length >= 4);
 
   const scored: Array<{ book: Book; score: number }> = [];
-  for (const b of books) {
-    const score = scoreFuzzyMatch(trimmed, [
-      b.bookNumber,
-      b.title,
-      b.author || '',
-      b.category || '',
-    ]);
+
+  for (let i = 0; i < books.length; i++) {
+    const b = books[i];
+    const idx = getIndexedBookSearch(b);
+
+    let score = 0;
+    if (idx.canonNum === q || idx.canonTitle === q) {
+      score = 100;
+    } else if (idx.canonTitle.startsWith(q) || idx.canonNum.startsWith(q)) {
+      score = 94;
+    } else if (idx.canonTitle.includes(q) || idx.canonAuthor.includes(q) || idx.canonNum.includes(q)) {
+      score = 86;
+    } else if (idx.relTitle === qRel) {
+      score = 92;
+    } else if (idx.relTitle.startsWith(qRel)) {
+      score = 85;
+    } else if (
+      idx.relTitle.includes(qRel) ||
+      idx.relAuthor.includes(qRel) ||
+      idx.relCategory.includes(qRel) ||
+      idx.relNum.includes(qRel)
+    ) {
+      score = 78;
+    } else if (qTokens.length > 1) {
+      // Multi-word query across combined fields (e.g., author + title)
+      let allMatched = true;
+      let sum = 0;
+      for (let ti = 0; ti < qTokens.length; ti++) {
+        const qt = qTokens[ti];
+        const qrt = qRelTokens[ti] || qt;
+        if (idx.canonCombined.includes(qt)) {
+          sum += 0.9;
+        } else if (idx.relCombined.includes(qrt)) {
+          sum += 0.82;
+        } else if (allowFuzzyTypo && qrt.length >= 4) {
+          let bestDist = 3;
+          const allowed = qrt.length >= 7 ? 2 : 1;
+          for (let wi = 0; wi < idx.relWords.length; wi++) {
+            const fw = idx.relWords[wi];
+            if (fw.length < 4) continue;
+            const d = boundedLevenshtein(qrt, fw, allowed);
+            if (d < bestDist) {
+              bestDist = d;
+              if (d === 1) break;
+            }
+          }
+          if (bestDist <= allowed) {
+            sum += bestDist === 1 ? 0.72 : 0.58;
+          } else {
+            allMatched = false;
+            break;
+          }
+        } else {
+          allMatched = false;
+          break;
+        }
+      }
+      if (allMatched) {
+        score = Math.round((sum / qTokens.length) * 72);
+      }
+    } else if (allowFuzzyTypo && qRel.length >= 4) {
+      const allowed = qRel.length >= 7 ? 2 : 1;
+      let bestDist = 3;
+      for (let wi = 0; wi < idx.relWords.length; wi++) {
+        const fw = idx.relWords[wi];
+        if (fw.length < 4) continue;
+        const d = boundedLevenshtein(qRel, fw, allowed);
+        if (d < bestDist) {
+          bestDist = d;
+          if (d === 1) break;
+        }
+      }
+      if (bestDist <= allowed) {
+        score = bestDist === 1 ? 65 : 52;
+      }
+    }
+
     if (score > 0) {
       scored.push({ book: b, score });
     }
   }
+
   scored.sort((a, b) => b.score - a.score);
   return scored.map((s) => s.book);
 }
@@ -205,13 +430,14 @@ export async function runSelfHealingAudit(params: {
   transactions: TransactionRecord[];
   students: Student[];
   offlineQueue: OfflinePendingAction[];
+  isTransactionsTruncated?: boolean;
 }): Promise<{ repairedBooks: number; repairedStudents: number }> {
   const nowMs = Date.now();
-  if (!navigator.onLine || nowMs - lastSelfHealAt < 180_000) {
+  if (!navigator.onLine || nowMs - lastSelfHealAt < 600_000) {
     return { repairedBooks: 0, repairedStudents: 0 };
   }
-  // Do not alter stock if offline actions are still waiting to sync
-  if (params.offlineQueue.length > 0) {
+  // Do not alter stock if offline actions are waiting or transactions snapshot is truncated
+  if (params.offlineQueue.length > 0 || params.isTransactionsTruncated) {
     return { repairedBooks: 0, repairedStudents: 0 };
   }
   lastSelfHealAt = nowMs;
@@ -237,6 +463,19 @@ export async function runSelfHealingAudit(params: {
     if (book.isDeleted) continue;
     const totalQty = Math.max(1, book.quantity || 1);
     const activeList = activeBorrowsByBook.get(book.id) || [];
+    const currentAvail = getBookAvailableCount(book);
+
+    // Fast skip for untouched books (99.9% of 20k bundled catalog)
+    if (
+      activeList.length === 0 &&
+      (book.borrowCount || 0) === 0 &&
+      currentAvail === totalQty &&
+      !book.currentBorrowerName &&
+      book.status === (book.isActive ? 'mavjud' : 'faol_emas')
+    ) {
+      continue;
+    }
+
     const expectedAvail = Math.max(0, totalQty - activeList.length);
     const expectedStatus: Book['status'] = book.isActive
       ? expectedAvail > 0
@@ -244,7 +483,6 @@ export async function runSelfHealingAudit(params: {
         : 'olingan'
       : 'faol_emas';
 
-    const currentAvail = getBookAvailableCount(book);
     const latestHolder = activeList[0];
     const expectedHolderName = latestHolder?.studentFullName || '';
 
@@ -256,7 +494,7 @@ export async function runSelfHealingAudit(params: {
     if (needsRepair) {
       repairedBooks += 1;
       tasks.push(
-        updateDoc(doc(db, 'books', book.id), {
+        upsertBookDoc(book.id, book, {
           availableQuantity: expectedAvail,
           status: expectedStatus,
           currentTransactionId: latestHolder?.id || '',
@@ -284,24 +522,8 @@ export async function runSelfHealingAudit(params: {
     }
   }
 
-  // Opportunistic cleanup of expired temporary QR upload sessions (> 2 hours old)
-  void getDocs(collection(db, 'qrUploads'))
-    .then((snap) => {
-      const cutoff = nowMs - 2 * 60 * 60 * 1000;
-      snap.forEach((d) => {
-        const data = d.data() as { createdAt?: string };
-        const ts = data.createdAt ? new Date(data.createdAt).getTime() : 0;
-        if (ts > 0 && ts < cutoff) {
-          void deleteDoc(d.ref).catch(() => {});
-        }
-      });
-    })
-    .catch(() => {
-      // Rules intentionally disallow qrUploads list; safe no-op when disallowed
-    });
-
   if (tasks.length > 0) {
-    await Promise.allSettled(tasks);
+    await Promise.allSettled(tasks.slice(0, 30));
     logAdminActivityNonBlocking({
       action: 'Avtomatik ichki tizim tuzatishi',
       targetType: 'system',

@@ -1,3 +1,6 @@
+export const DEFAULT_BOOK_COVER_URL =
+  '/assets/aistudio/IIV_Andijon_Academic_Lyceum_Cover__1__8dae0d95.png';
+
 export function compressImageElementToDataUrl(
   source: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement,
   maxWidth = 360,
@@ -89,15 +92,96 @@ export function sanitizeForPdf(text: string): string {
     .replace(/\u00B7/g, '·');
 }
 
+const CYRILLIC_TO_LATIN_MAP: Record<string, string> = {
+  а: 'a',
+  б: 'b',
+  в: 'v',
+  г: 'g',
+  д: 'd',
+  е: 'e',
+  ё: 'yo',
+  ж: 'j',
+  з: 'z',
+  и: 'i',
+  й: 'y',
+  к: 'k',
+  л: 'l',
+  м: 'm',
+  н: 'n',
+  о: 'o',
+  п: 'p',
+  р: 'r',
+  с: 's',
+  т: 't',
+  у: 'u',
+  ф: 'f',
+  х: 'x',
+  ц: 'ts',
+  ч: 'ch',
+  ш: 'sh',
+  щ: 'shch',
+  ъ: '',
+  ы: 'i',
+  ь: '',
+  э: 'e',
+  ю: 'yu',
+  я: 'ya',
+  ў: 'o',
+  қ: 'q',
+  ғ: 'g',
+  ҳ: 'h',
+  і: 'i',
+  ї: 'yi',
+  є: 'e',
+};
+
+export function transliterateToLatinCanonical(text: string): string {
+  const lowered = (text || '')
+    .normalize('NFC')
+    .trim()
+    .toLowerCase()
+    .replace(/[\u2018\u2019\u02BB\u02BC\u02B9\u2032ʼ′`ʻ]/g, "'");
+
+  // Handle Uzbek Latin o' and g' cleanly, then strip remaining apostrophes
+  const normalizedLatin = lowered
+    .replace(/([og])'/g, '$1')
+    .replace(/'/g, '');
+
+  let out = '';
+  for (let i = 0; i < normalizedLatin.length; i++) {
+    const ch = normalizedLatin[i];
+    out += CYRILLIC_TO_LATIN_MAP[ch] ?? ch;
+  }
+
+  // Collapse initial / post-vowel "ye" to "e" so Cyrillic "е" (Европа/Ер) matches Latin "Yevropa/Yer"
+  return out
+    .replace(/(^|[\s.,;:!?()[\]"'/-]|a|e|i|o|u)ye/g, '$1e')
+    .replace(/[^a-z0-9.\-\s]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function toRelaxedPhonetic(canonicalText: string): string {
+  return canonicalText
+    .replace(/kh/g, 'h')
+    .replace(/x/g, 'h')
+    .replace(/q/g, 'k')
+    .replace(/shch/g, 'sh')
+    .replace(/zh/g, 'j')
+    .replace(/ts/g, 's')
+    .replace(/c(?!h)/g, 's')
+    .replace(/w/g, 'v');
+}
+
 export function normalizeStudentId(
   firstName: string,
   lastName: string,
   group: string,
   course: string
 ): string {
-  const raw = `${firstName.trim()}_${lastName.trim()}_${group.trim()}_${course.trim()}`
-    .toLowerCase()
-    .replace(/['\u2018\u2019\u02BB\u02BC\u02B9\u2032ʼ′`]/g, '')
+  const raw = transliterateToLatinCanonical(
+    `${firstName.trim()}_${lastName.trim()}_${group.trim()}_${course.trim()}`
+  )
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '');
   return raw ? `st_${raw.slice(0, 96)}` : `st_${Date.now()}`;

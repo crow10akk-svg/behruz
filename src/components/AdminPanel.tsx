@@ -26,6 +26,7 @@ import {
   Menu,
   Power,
   Printer,
+  RotateCcw,
   Search,
   Settings,
   ShieldCheck,
@@ -35,6 +36,7 @@ import {
 } from 'lucide-react';
 import { BookCoverImage } from './BookCoverImage.tsx';
 import { AdminBookForm } from './AdminBookForm.tsx';
+import { AdminExcelImport } from './AdminExcelImport.tsx';
 import { StudentHistoryModal, TransactionDetailModal } from './AdminDetailModals.tsx';
 import { UzDateSelects, buildReturnIso, getTodayDateStr } from './UzDateSelects.tsx';
 import {
@@ -47,12 +49,14 @@ import {
   getBookAvailableCount,
   loadOfflineQueue,
   logAdminActivityNonBlocking,
+  restoreBookAdmin,
   softDeleteBookAdmin,
   toggleBookActiveAdmin,
   updateLibrarySettingsAdmin,
 } from '../lib/libraryService.ts';
 import {
   computeLibraryInsights,
+  matchesCachedRecordQuery,
   runSelfHealingAudit,
   scoreFuzzyMatch,
   smartFilterBooks,
@@ -76,8 +80,10 @@ import type {
 
 interface AdminPanelProps {
   books: Book[];
+  deletedBooks: Book[];
   students: Student[];
   transactions: TransactionRecord[];
+  isTransactionsTruncated?: boolean;
   signatures: Record<string, SignatureRecord>;
   activityLogs: ActivityLogRecord[];
   settings: LibrarySetting;
@@ -96,6 +102,7 @@ const MENU_ITEMS: Array<{ id: AdminMenuId; label: string; icon: React.ComponentT
   { id: 'students', label: 'O‘quvchilar bazasi', icon: Users },
   { id: 'search', label: 'Qidiruv', icon: Search },
   { id: 'reports', label: 'Hisobotlar', icon: BarChart3 },
+  { id: 'database', label: 'Ma’lumotlar bazasi', icon: Database },
   { id: 'settings', label: 'Sozlamalar', icon: Settings },
 ];
 
@@ -146,8 +153,10 @@ const REPORT_TYPES: Array<{ id: ReportType; label: string }> = [
 
 export function AdminPanel({
   books,
+  deletedBooks,
   students,
   transactions,
+  isTransactionsTruncated = false,
   signatures,
   activityLogs,
   settings,
@@ -157,10 +166,16 @@ export function AdminPanel({
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
   const [editingBook, setEditingBook] = useState<Book | null>(null);
+  const [addBookMode, setAddBookMode] = useState<'single' | 'excel'>('single');
   const [deleteTarget, setDeleteTarget] = useState<Book | null>(null);
   const [bookCatalogFilter, setBookCatalogFilter] = useState('');
   const [bookCatalogStatus, setBookCatalogStatus] = useState<'all' | 'mavjud' | 'olingan' | 'inactive'>('all');
   const [booksViewMode, setBooksViewMode] = useState<'catalog' | 'table'>('catalog');
+  const [adminBooksLimit, setAdminBooksLimit] = useState(100);
+  const [dbSearchQuery, setDbSearchQuery] = useState('');
+  const [dbFilterTab, setDbFilterTab] = useState<'all' | 'active' | 'inactive' | 'deleted'>('all');
+  const [dbBooksLimit, setDbBooksLimit] = useState(100);
+  const [restoringBookId, setRestoringBookId] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
   const [selectedTx, setSelectedTx] = useState<TransactionRecord | null>(null);
@@ -191,9 +206,11 @@ export function AdminPanel({
   // Universal Admin quick search (works anywhere in Admin Panel: name, surname, group, book)
   const [quickAdminQuery, setQuickAdminQuery] = useState('');
 
-  // Student directory search & filter
+  // Student directory search, filter & pagination
   const [studentListQuery, setStudentListQuery] = useState('');
   const [studentCourseFilter, setStudentCourseFilter] = useState<'all' | '1-kurs' | '2-kurs'>('all');
+  const [studentsLimit, setStudentsLimit] = useState(50);
+  const [quickStudentsLimit, setQuickStudentsLimit] = useState(50);
 
   // Pagination state so 1000+ rows stay fast and fully accessible
   const [txPage, setTxPage] = useState(1);
@@ -225,29 +242,33 @@ export function AdminPanel({
   const [lastAutoHealText, setLastAutoHealText] = useState<string | null>(null);
 
   useEffect(() => {
-    if (books.length === 0) return;
+    if (books.length === 0 || isTransactionsTruncated) return;
     let cancelled = false;
-    void runSelfHealingAudit({
-      books,
-      transactions,
-      students,
-      offlineQueue: loadOfflineQueue(),
-    })
-      .then((res) => {
-        if (cancelled) return;
-        if (res.repairedBooks > 0 || res.repairedStudents > 0) {
-          setLastAutoHealText(
-            `Avtomatik nazorat: ${res.repairedBooks} ta kitob va ${res.repairedStudents} ta o‘quvchi hisobi muvofiqlashtirildi.`
-          );
-        }
+    const timer = setTimeout(() => {
+      void runSelfHealingAudit({
+        books,
+        transactions,
+        students,
+        offlineQueue: loadOfflineQueue(),
+        isTransactionsTruncated,
       })
-      .catch(() => {
-        // Non-blocking background audit
-      });
+        .then((res) => {
+          if (cancelled) return;
+          if (res.repairedBooks > 0 || res.repairedStudents > 0) {
+            setLastAutoHealText(
+              `Avtomatik nazorat: ${res.repairedBooks} ta kitob va ${res.repairedStudents} ta o‘quvchi hisobi muvofiqlashtirildi.`
+            );
+          }
+        })
+        .catch(() => {
+          // Non-blocking background audit
+        });
+    }, 2500);
     return () => {
       cancelled = true;
+      clearTimeout(timer);
     };
-  }, [books, transactions, students]);
+  }, [books, transactions, students, isTransactionsTruncated]);
 
   const activeHoldingTxs = useMemo(
     () => transactions.filter((t) => t.type === 'borrow' && t.status === 'active'),
@@ -291,7 +312,7 @@ export function AdminPanel({
   const suggestedNextNumber = useMemo(() => {
     let maxNum = 0;
     books.forEach((b) => {
-      const parsed = parseInt(b.bookNumber.replace(/\D/g, ''), 10);
+      const parsed = parseInt(String(b.bookNumber || '').replace(/\D/g, ''), 10);
       if (!Number.isNaN(parsed) && parsed > maxNum) maxNum = parsed;
     });
     return String(maxNum + 1).padStart(3, '0');
@@ -309,8 +330,10 @@ export function AdminPanel({
   const deferredGlobalQuery = useDeferredValue(globalQuery);
   const deferredBookCatalogFilter = useDeferredValue(bookCatalogFilter);
   const deferredStudentListQuery = useDeferredValue(studentListQuery);
+  const deferredDbSearchQuery = useDeferredValue(dbSearchQuery);
 
   const filteredSearchTxs = useMemo(() => {
+    if (activeMenu !== 'search') return [];
     const q = deferredGlobalQuery.trim();
     const qNormGroup = normalizeGroupKey(q.toLowerCase());
     return transactions.filter((t) => {
@@ -336,8 +359,9 @@ export function AdminPanel({
 
       if (!q) return true;
       if (qNormGroup && normalizeGroupKey(t.studentGroup).includes(qNormGroup)) return true;
-      return (
-        scoreFuzzyMatch(q, [
+      return matchesCachedRecordQuery(
+        t,
+        [
           t.studentFullName,
           t.studentFirstName,
           t.studentLastName,
@@ -345,12 +369,14 @@ export function AdminPanel({
           t.studentCourse,
           t.bookTitle,
           t.bookNumber,
-        ]) > 0
+        ],
+        q
       );
     });
-  }, [transactions, deferredGlobalQuery, txStatusFilter, groupFilter, dateFrom, dateTo]);
+  }, [activeMenu, transactions, deferredGlobalQuery, txStatusFilter, groupFilter, dateFrom, dateTo]);
 
   const filteredAdminBooks = useMemo(() => {
+    if (activeMenu !== 'all-books') return [];
     const preFiltered = books.filter((b) => {
       const avail = getBookAvailableCount(b);
       if (bookCatalogStatus === 'mavjud' && (!b.isActive || avail <= 0)) return false;
@@ -361,10 +387,29 @@ export function AdminPanel({
     const q = deferredBookCatalogFilter.trim();
     if (!q) return preFiltered;
     return smartFilterBooks(preFiltered, q);
-  }, [books, deferredBookCatalogFilter, bookCatalogStatus]);
+  }, [activeMenu, books, deferredBookCatalogFilter, bookCatalogStatus]);
+
+  const filteredDbBooks = useMemo(() => {
+    if (activeMenu !== 'database') return [];
+    let pool: Book[];
+    if (dbFilterTab === 'deleted') {
+      pool = deletedBooks;
+    } else if (dbFilterTab === 'active') {
+      pool = books.filter((b) => b.isActive);
+    } else if (dbFilterTab === 'inactive') {
+      pool = books.filter((b) => !b.isActive);
+    } else {
+      pool = [...books, ...deletedBooks];
+    }
+    const q = deferredDbSearchQuery.trim();
+    if (!q) return pool;
+    return smartFilterBooks(pool, q);
+  }, [activeMenu, books, deletedBooks, dbFilterTab, deferredDbSearchQuery]);
 
   // Build 1-kurs and 2-kurs group summaries merging standard groups + actual DB groups
   const courseGroupDirectory = useMemo(() => {
+    const empty = { '1-kurs': [], '2-kurs': [] };
+    if (activeMenu !== 'courses-groups' && !deferredQuickAdminQuery.trim()) return empty;
     const buildForCourse = (courseName: '1-kurs' | '2-kurs') => {
       const groupMap = new Map<
         string,
@@ -444,7 +489,7 @@ export function AdminPanel({
       '1-kurs': buildForCourse('1-kurs'),
       '2-kurs': buildForCourse('2-kurs'),
     };
-  }, [students, transactions]);
+  }, [activeMenu, deferredQuickAdminQuery, students, transactions]);
 
   const activeSelectedGroupData = useMemo(() => {
     if (!selectedGroupDetail) return null;
@@ -480,23 +525,20 @@ export function AdminPanel({
   }, [courseGroupDirectory]);
 
   const filteredStudentsList = useMemo(() => {
+    if (activeMenu !== 'students') return [];
     const q = deferredStudentListQuery.trim();
     const qGroup = normalizeGroupKey(q.toLowerCase());
     return students.filter((st) => {
       if (studentCourseFilter !== 'all' && st.course !== studentCourseFilter) return false;
       if (!q) return true;
       if (qGroup && normalizeGroupKey(st.group).includes(qGroup)) return true;
-      return (
-        scoreFuzzyMatch(q, [
-          st.fullName,
-          st.firstName,
-          st.lastName,
-          st.group,
-          st.course,
-        ]) > 0
+      return matchesCachedRecordQuery(
+        st,
+        [st.fullName, st.firstName, st.lastName, st.group, st.course],
+        q
       );
     });
-  }, [students, deferredStudentListQuery, studentCourseFilter]);
+  }, [activeMenu, students, deferredStudentListQuery, studentCourseFilter]);
 
   const quickSearchResults = useMemo(() => {
     const qRaw = deferredQuickAdminQuery.trim();
@@ -538,41 +580,53 @@ export function AdminPanel({
     const matchedStudents = students.filter(
       (st) =>
         (qGroup && normalizeGroupKey(st.group).includes(qGroup)) ||
-        scoreFuzzyMatch(qRaw, [
-          st.fullName,
-          st.firstName,
-          st.lastName,
-          st.group,
-          st.course,
-        ]) > 0
+        matchesCachedRecordQuery(
+          st,
+          [st.fullName, st.firstName, st.lastName, st.group, st.course],
+          qRaw
+        )
     );
 
     const matchedTxs = transactions.filter(
       (t) =>
         (qGroup && normalizeGroupKey(t.studentGroup).includes(qGroup)) ||
-        scoreFuzzyMatch(qRaw, [
-          t.studentFullName,
-          t.studentFirstName,
-          t.studentLastName,
-          t.studentGroup,
-          t.studentCourse,
-          t.bookTitle,
-          t.bookNumber,
-        ]) > 0
+        matchesCachedRecordQuery(
+          t,
+          [
+            t.studentFullName,
+            t.studentFirstName,
+            t.studentLastName,
+            t.studentGroup,
+            t.studentCourse,
+            t.bookTitle,
+            t.bookNumber,
+          ],
+          qRaw
+        )
     );
 
     return { matchedGroups, matchedStudents, matchedTxs };
   }, [deferredQuickAdminQuery, courseGroupDirectory, students, transactions]);
 
-  const insights = useMemo(
-    () => computeLibraryInsights(books, transactions, students),
-    [books, transactions, students]
-  );
+  const insights = useMemo(() => {
+    if (activeMenu !== 'dashboard') {
+      return {
+        overdueCount: 0,
+        depletedPopularBooks: [],
+        topGroup: null,
+        returnRatePct: 100,
+        summaryText: '',
+      };
+    }
+    return computeLibraryInsights(books, transactions, students);
+  }, [activeMenu, books, transactions, students]);
 
-  const currentReportData = useMemo(
-    () => buildReportData(selectedReport, books, students, transactions),
-    [selectedReport, books, students, transactions]
-  );
+  const currentReportData = useMemo(() => {
+    if (activeMenu !== 'reports') {
+      return { title: '', subtitle: '', columns: [], rows: [] };
+    }
+    return buildReportData(selectedReport, books, students, transactions);
+  }, [activeMenu, selectedReport, books, students, transactions]);
 
   const currentMenuLabel =
     MENU_ITEMS.find((m) => m.id === activeMenu)?.label || 'Bosh sahifa';
@@ -600,7 +654,7 @@ export function AdminPanel({
       await softDeleteBookAdmin(deleteTarget);
       setActionMessage({
         type: 'ok',
-        text: `«${deleteTarget.title}» katalogdan o‘chirildi (tarixiy yozuvlar saqlandi).`,
+        text: `«${deleteTarget.title}» katalogdan o‘chirildi (ma’lumotlar bazasi va tarixda saqlandi).`,
       });
       setDeleteTarget(null);
     } catch (err) {
@@ -609,6 +663,25 @@ export function AdminPanel({
         text: err instanceof Error ? err.message : 'Kitobni o‘chirishda xatolik.',
       });
       setDeleteTarget(null);
+    }
+  };
+
+  const handleRestoreBook = async (book: Book) => {
+    setActionMessage(null);
+    setRestoringBookId(book.id);
+    try {
+      await restoreBookAdmin(book);
+      setActionMessage({
+        type: 'ok',
+        text: `«${book.title}» (№ ${book.bookNumber}) faol katalogga muvaffaqiyatli tiklandi.`,
+      });
+    } catch (err) {
+      setActionMessage({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Kitobni tiklashda xatolik yuz berdi.',
+      });
+    } finally {
+      setRestoringBookId(null);
     }
   };
 
@@ -845,7 +918,11 @@ export function AdminPanel({
                 <option value={50}>50 tadan</option>
                 <option value={100}>100 tadan</option>
                 <option value={250}>250 tadan</option>
-                <option value={0}>Barchasi ({rows.length})</option>
+                {rows.length <= 500 ? (
+                  <option value={0}>Barchasi ({rows.length})</option>
+                ) : (
+                  <option value={500}>500 tadan</option>
+                )}
               </select>
               {totalPages > 1 && (
                 <div className="inline-flex items-center gap-1">
@@ -1191,6 +1268,7 @@ export function AdminPanel({
                 value={quickAdminQuery}
                 onChange={(e) => {
                   setQuickAdminQuery(e.target.value);
+                  setQuickStudentsLimit(50);
                   setTxPage(1);
                 }}
                 placeholder="Tezkor qidiruv: ism, familiya (masalan: Aliyev), guruh (masalan: 1.1 yoki 2.10) yoki kitob..."
@@ -1338,7 +1416,7 @@ export function AdminPanel({
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100">
-                        {quickSearchResults.matchedStudents.map((st) => (
+                        {quickSearchResults.matchedStudents.slice(0, quickStudentsLimit).map((st) => (
                           <tr key={st.id} className="hover:bg-slate-50/80">
                             <td className="py-2.5 px-4 font-semibold text-slate-900">
                               {st.fullName}
@@ -1367,6 +1445,17 @@ export function AdminPanel({
                       </tbody>
                     </table>
                   </div>
+                  {quickSearchResults.matchedStudents.length > quickStudentsLimit && (
+                    <div className="px-5 py-3 border-t border-slate-100 bg-slate-50/70 text-center">
+                      <button
+                        type="button"
+                        onClick={() => setQuickStudentsLimit((prev) => prev + 50)}
+                        className="text-xs font-semibold text-blue-700 hover:underline tabular-nums"
+                      >
+                        Yana ko‘rsatish ({quickStudentsLimit} / {quickSearchResults.matchedStudents.length})
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -1615,7 +1704,10 @@ export function AdminPanel({
                         <input
                           type="text"
                           value={bookCatalogFilter}
-                          onChange={(e) => setBookCatalogFilter(e.target.value)}
+                          onChange={(e) => {
+                            setBookCatalogFilter(e.target.value);
+                            setAdminBooksLimit(100);
+                          }}
                           placeholder="Kitob nomi, muallif yoki raqami bo‘yicha qidiring..."
                           className="w-full min-h-[44px] pl-10 pr-4 py-2 text-sm rounded-xl border border-slate-300 bg-white focus:outline-none focus:ring-2 focus:ring-blue-600"
                         />
@@ -1631,11 +1723,12 @@ export function AdminPanel({
                           <button
                             key={tab.id}
                             type="button"
-                            onClick={() =>
+                            onClick={() => {
                               setBookCatalogStatus(
                                 tab.id as 'all' | 'mavjud' | 'olingan' | 'inactive'
-                              )
-                            }
+                              );
+                              setAdminBooksLimit(100);
+                            }}
                             className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap ${
                               bookCatalogStatus === tab.id
                                 ? 'bg-white text-slate-900 shadow-xs'
@@ -1648,10 +1741,37 @@ export function AdminPanel({
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-3 shrink-0">
+                    <div className="flex flex-wrap items-center gap-3 shrink-0">
                       <span className="text-xs text-slate-500 tabular-nums">
                         Jami: {filteredAdminBooks.length} ta kitob
                       </span>
+                      {filteredAdminBooks.length > adminBooksLimit && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setAdminBooksLimit((prev) =>
+                              filteredAdminBooks.length > 1000
+                                ? Math.min(filteredAdminBooks.length, prev + 500)
+                                : filteredAdminBooks.length
+                            )
+                          }
+                          className="text-xs font-semibold text-blue-700 hover:underline tabular-nums"
+                        >
+                          {filteredAdminBooks.length > 1000 ? '+500 ta ko‘rsatish' : 'Barchasini ko‘rsatish'}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingBook(null);
+                          setAddBookMode('excel');
+                          setActiveMenu('add-book');
+                        }}
+                        className="inline-flex items-center gap-1.5 min-h-[38px] px-3.5 py-1.5 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-xl transition-colors whitespace-nowrap"
+                      >
+                        <FileSpreadsheet className="w-3.5 h-3.5" />
+                        <span>Excel import</span>
+                      </button>
                       <div className="inline-flex items-center gap-1 p-1 bg-slate-200/75 rounded-xl">
                         <button
                           type="button"
@@ -1687,7 +1807,7 @@ export function AdminPanel({
                     </div>
                   ) : booksViewMode === 'catalog' ? (
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
-                      {filteredAdminBooks.map((book) => {
+                      {filteredAdminBooks.slice(0, adminBooksLimit).map((book) => {
                         const totalQty = Math.max(1, book.quantity || 1);
                         const availQty = getBookAvailableCount(book);
                         const isLocked = availQty <= 0;
@@ -1713,12 +1833,12 @@ export function AdminPanel({
                                 className={`w-full h-full ${isLocked || !book.isActive ? 'opacity-75' : ''}`}
                               />
 
-                              <span className="absolute top-3 left-3 px-2.5 py-1 rounded-lg bg-slate-950/80 text-white font-mono text-xs font-semibold tabular-nums">
+                              <span className="absolute bottom-2.5 left-2.5 px-2.5 py-1 rounded-lg bg-slate-950/85 text-white font-mono text-xs font-semibold tabular-nums">
                                 № {book.bookNumber}
                               </span>
 
                               <span
-                                className={`absolute top-3 right-3 inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold shadow-xs ${
+                                className={`absolute bottom-2.5 right-2.5 inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold shadow-xs ${
                                   !book.isActive
                                     ? 'bg-slate-800 text-white'
                                     : isLocked
@@ -1809,7 +1929,7 @@ export function AdminPanel({
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-slate-100">
-                            {filteredAdminBooks.map((book) => {
+                            {filteredAdminBooks.slice(0, adminBooksLimit).map((book) => {
                               const totalQty = Math.max(1, book.quantity || 1);
                               const availQty = getBookAvailableCount(book);
                               const overdue =
@@ -1819,6 +1939,7 @@ export function AdminPanel({
                                   <td className="py-3 px-4">
                                     <div className="w-11 h-14 rounded-lg overflow-hidden border border-slate-200">
                                       <BookCoverImage
+                                        compact
                                         coverUrl={book.coverUrl}
                                         title={book.title}
                                         bookNumber={book.bookNumber}
@@ -1901,23 +2022,91 @@ export function AdminPanel({
                       </div>
                     </div>
                   )}
+                  {filteredAdminBooks.length > adminBooksLimit && (
+                    <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
+                      <button
+                        type="button"
+                        onClick={() => setAdminBooksLimit((prev) => prev + 100)}
+                        className="min-h-[42px] px-5 py-2 text-xs font-semibold text-white bg-[#0F2942] hover:bg-slate-800 rounded-xl transition-colors tabular-nums"
+                      >
+                        Yana 100 ta ko‘rsatish (qolgan: {filteredAdminBooks.length - adminBooksLimit} ta)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setAdminBooksLimit((prev) =>
+                            filteredAdminBooks.length > 1000
+                              ? Math.min(filteredAdminBooks.length, prev + 500)
+                              : filteredAdminBooks.length
+                          )
+                        }
+                        className="min-h-[42px] px-5 py-2 text-xs font-semibold text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 rounded-xl transition-colors tabular-nums"
+                      >
+                        {filteredAdminBooks.length > 1000
+                          ? 'Yana 500 ta ko‘rsatish'
+                          : `Barchasini ko‘rsatish (${filteredAdminBooks.length} ta)`}
+                      </button>
+                    </div>
+                  )}
                 </>
               )}
             </div>
           )}
 
-          {/* 3. YANGI KITOB QO‘SHISH */}
+          {/* 3. YANGI KITOB QO‘SHISH (BITTALAB YOKI EXCEL IMPORT) */}
           {activeMenu === 'add-book' && (
-            <AdminBookForm
-              existingBooks={books}
-              suggestedNextNumber={suggestedNextNumber}
-              onSuccess={() => {
-                setActionMessage({
-                  type: 'ok',
-                  text: 'Yangi kitob bazaga qo‘shildi va o‘quvchilar katalogida faollashdi.',
-                });
-              }}
-            />
+            <div className="space-y-4">
+              <div className="inline-flex items-center gap-1 p-1 bg-slate-200/80 rounded-xl">
+                <button
+                  type="button"
+                  onClick={() => setAddBookMode('single')}
+                  className={`inline-flex items-center gap-2 min-h-[38px] px-4 py-1.5 text-xs font-semibold rounded-lg transition-colors ${
+                    addBookMode === 'single'
+                      ? 'bg-white text-slate-900 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <BookPlus className="w-4 h-4" />
+                  <span>Bittalab qo‘shish</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAddBookMode('excel')}
+                  className={`inline-flex items-center gap-2 min-h-[38px] px-4 py-1.5 text-xs font-semibold rounded-lg transition-colors ${
+                    addBookMode === 'excel'
+                      ? 'bg-white text-emerald-800 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <FileSpreadsheet className="w-4 h-4" />
+                  <span>Excel fayldan import (.xlsx)</span>
+                </button>
+              </div>
+
+              {addBookMode === 'excel' ? (
+                <AdminExcelImport
+                  existingBooks={books}
+                  onImported={(summaryText) => {
+                    setActionMessage({
+                      type: 'ok',
+                      text: summaryText,
+                    });
+                  }}
+                  onOpenCatalog={() => setActiveMenu('all-books')}
+                />
+              ) : (
+                <AdminBookForm
+                  existingBooks={books}
+                  suggestedNextNumber={suggestedNextNumber}
+                  onSuccess={() => {
+                    setActionMessage({
+                      type: 'ok',
+                      text: 'Yangi kitob bazaga qo‘shildi va o‘quvchilar katalogida faollashdi.',
+                    });
+                  }}
+                />
+              )}
+            </div>
           )}
 
           {/* 3.5. 1-KURS VA 2-KURS GURUHLARI */}
@@ -2342,7 +2531,10 @@ export function AdminPanel({
                   <input
                     type="text"
                     value={studentListQuery}
-                    onChange={(e) => setStudentListQuery(e.target.value)}
+                    onChange={(e) => {
+                      setStudentListQuery(e.target.value);
+                      setStudentsLimit(50);
+                    }}
                     placeholder="O‘quvchi ismi, familiyasi yoki guruhi (1.1, 2.10) bo‘yicha qidirish..."
                     className="w-full min-h-[42px] pl-10 pr-4 py-2 text-sm rounded-xl border border-slate-300 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-600"
                   />
@@ -2356,9 +2548,10 @@ export function AdminPanel({
                     <button
                       key={tab.id}
                       type="button"
-                      onClick={() =>
-                        setStudentCourseFilter(tab.id as 'all' | '1-kurs' | '2-kurs')
-                      }
+                      onClick={() => {
+                        setStudentCourseFilter(tab.id as 'all' | '1-kurs' | '2-kurs');
+                        setStudentsLimit(50);
+                      }}
                       className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors ${
                         studentCourseFilter === tab.id
                           ? 'bg-white text-slate-900 shadow-xs'
@@ -2377,47 +2570,69 @@ export function AdminPanel({
                     Qidiruv bo‘yicha o‘quvchilar topilmadi.
                   </div>
                 ) : (
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-left text-xs sm:text-sm">
-                      <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 text-xs">
-                        <tr>
-                          <th className="py-3 px-4 font-semibold">Ism-familiya</th>
-                          <th className="py-3 px-4 font-semibold">Guruh</th>
-                          <th className="py-3 px-4 font-semibold">Kurs</th>
-                          <th className="py-3 px-4 font-semibold">Olgan kitoblari</th>
-                          <th className="py-3 px-4 font-semibold">Topshirgan</th>
-                          <th className="py-3 px-4 font-semibold">Hozir o‘zida</th>
-                          <th className="py-3 px-4 font-semibold text-right">Tarix</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-100">
-                        {filteredStudentsList.map((st) => (
-                          <tr key={st.id} className="hover:bg-slate-50/80">
-                            <td className="py-3 px-4 font-semibold text-slate-900">{st.fullName}</td>
-                            <td className="py-3 px-4 text-slate-700">{st.group}</td>
-                            <td className="py-3 px-4 text-slate-700">{st.course}</td>
-                            <td className="py-3 px-4 font-mono tabular-nums">{st.totalBorrowed}</td>
-                            <td className="py-3 px-4 font-mono tabular-nums text-emerald-700">
-                              {st.totalReturned}
-                            </td>
-                            <td className="py-3 px-4 font-mono tabular-nums font-semibold text-amber-700">
-                              {st.activeCount}
-                            </td>
-                            <td className="py-3 px-4 text-right">
-                              <button
-                                type="button"
-                                onClick={() => setSelectedStudent(st)}
-                                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-50 rounded-lg transition-colors"
-                              >
-                                <Eye className="w-3.5 h-3.5" />
-                                <span>To‘liq tarix</span>
-                              </button>
-                            </td>
+                  <>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs sm:text-sm">
+                        <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 text-xs">
+                          <tr>
+                            <th className="py-3 px-4 font-semibold">Ism-familiya</th>
+                            <th className="py-3 px-4 font-semibold">Guruh</th>
+                            <th className="py-3 px-4 font-semibold">Kurs</th>
+                            <th className="py-3 px-4 font-semibold">Olgan kitoblari</th>
+                            <th className="py-3 px-4 font-semibold">Topshirgan</th>
+                            <th className="py-3 px-4 font-semibold">Hozir o‘zida</th>
+                            <th className="py-3 px-4 font-semibold text-right">Tarix</th>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {filteredStudentsList.slice(0, studentsLimit).map((st) => (
+                            <tr key={st.id} className="hover:bg-slate-50/80">
+                              <td className="py-3 px-4 font-semibold text-slate-900">{st.fullName}</td>
+                              <td className="py-3 px-4 text-slate-700">{st.group}</td>
+                              <td className="py-3 px-4 text-slate-700">{st.course}</td>
+                              <td className="py-3 px-4 font-mono tabular-nums">{st.totalBorrowed}</td>
+                              <td className="py-3 px-4 font-mono tabular-nums text-emerald-700">
+                                {st.totalReturned}
+                              </td>
+                              <td className="py-3 px-4 font-mono tabular-nums font-semibold text-amber-700">
+                                {st.activeCount}
+                              </td>
+                              <td className="py-3 px-4 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => setSelectedStudent(st)}
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-50 rounded-lg transition-colors"
+                                >
+                                  <Eye className="w-3.5 h-3.5" />
+                                  <span>To‘liq tarix</span>
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    {filteredStudentsList.length > studentsLimit && (
+                      <div className="px-4 py-3 border-t border-slate-200 bg-slate-50/70 flex flex-wrap items-center justify-center gap-3">
+                        <button
+                          type="button"
+                          onClick={() => setStudentsLimit((prev) => prev + 50)}
+                          className="min-h-[38px] px-4 py-1.5 text-xs font-semibold text-white bg-[#0F2942] hover:bg-slate-800 rounded-xl transition-colors tabular-nums"
+                        >
+                          Yana 50 ta ko‘rsatish ({studentsLimit}/{filteredStudentsList.length})
+                        </button>
+                        {filteredStudentsList.length <= 500 && (
+                          <button
+                            type="button"
+                            onClick={() => setStudentsLimit(filteredStudentsList.length)}
+                            className="min-h-[38px] px-4 py-1.5 text-xs font-semibold text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 rounded-xl transition-colors tabular-nums"
+                          >
+                            Barchasini ko‘rsatish ({filteredStudentsList.length})
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
             </div>
@@ -2579,7 +2794,7 @@ export function AdminPanel({
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100">
-                        {currentReportData.rows.map((row, idx) => (
+                        {currentReportData.rows.slice(0, 200).map((row, idx) => (
                           <tr key={idx} className="hover:bg-slate-50/70">
                             {row.map((cell, cIdx) => (
                               <td
@@ -2600,6 +2815,283 @@ export function AdminPanel({
                   </div>
                 )}
               </div>
+            </div>
+          )}
+
+          {/* 10.5. MA’LUMOTLAR BAZASI (BARCHASI VA O‘CHIRILGANLAR HAM) */}
+          {activeMenu === 'database' && (
+            <div className="space-y-5">
+              {editingBook ? (
+                <AdminBookForm
+                  editingBook={editingBook}
+                  existingBooks={books}
+                  onSuccess={() => setEditingBook(null)}
+                  onCancel={() => setEditingBook(null)}
+                />
+              ) : (
+                <>
+              {/* Summary Strip */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+                <div className="bg-white rounded-2xl border border-slate-200 p-4">
+                  <span className="text-xs text-slate-500 block">Jami kitoblar</span>
+                  <span className="font-display text-2xl font-bold text-slate-900 tabular-nums">
+                    {books.length + deletedBooks.length}
+                  </span>
+                </div>
+                <div className="bg-white rounded-2xl border border-slate-200 p-4">
+                  <span className="text-xs text-slate-500 block">Faol katalogda</span>
+                  <span className="font-display text-2xl font-bold text-emerald-700 tabular-nums">
+                    {books.filter((b) => b.isActive).length}
+                  </span>
+                </div>
+                <div className="bg-white rounded-2xl border border-red-200 bg-red-50/40 p-4">
+                  <span className="text-xs text-red-700 font-medium block">O‘chirilganlar</span>
+                  <span className="font-display text-2xl font-bold text-red-700 tabular-nums">
+                    {deletedBooks.length}
+                  </span>
+                </div>
+                <div className="bg-white rounded-2xl border border-slate-200 p-4">
+                  <span className="text-xs text-slate-500 block">O‘quvchilar</span>
+                  <span className="font-display text-2xl font-bold text-slate-900 tabular-nums">
+                    {students.length}
+                  </span>
+                </div>
+                <div className="bg-white rounded-2xl border border-slate-200 p-4">
+                  <span className="text-xs text-slate-500 block">Operatsiyalar</span>
+                  <span className="font-display text-2xl font-bold text-blue-700 tabular-nums">
+                    {transactions.length}
+                  </span>
+                </div>
+                <div className="bg-white rounded-2xl border border-slate-200 p-4">
+                  <span className="text-xs text-slate-500 block">Imzolar / Audit</span>
+                  <span className="font-display text-2xl font-bold text-slate-900 tabular-nums">
+                    {Object.keys(signatures).length} / {activityLogs.length}
+                  </span>
+                </div>
+              </div>
+
+              {/* Filter & Backup Bar */}
+              <div className="bg-white rounded-2xl border border-slate-200 p-4 space-y-3">
+                <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                  <div className="relative flex-1 max-w-xl">
+                    <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={dbSearchQuery}
+                      onChange={(e) => {
+                        setDbSearchQuery(e.target.value);
+                        setDbBooksLimit(100);
+                      }}
+                      placeholder="Bazadan qidirish (lotin, kirill, ruscha, muallif yoki raqam)..."
+                      className="w-full min-h-[42px] pl-10 pr-4 py-2 text-sm rounded-xl border border-slate-300 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                    />
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="inline-flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-xl">
+                      {[
+                        {
+                          id: 'all',
+                          label: `Barchasi (${books.length + deletedBooks.length})`,
+                        },
+                        {
+                          id: 'active',
+                          label: `Faol (${books.filter((b) => b.isActive).length})`,
+                        },
+                        {
+                          id: 'inactive',
+                          label: `Faol emas (${books.filter((b) => !b.isActive).length})`,
+                        },
+                        {
+                          id: 'deleted',
+                          label: `O‘chirilganlar (${deletedBooks.length})`,
+                        },
+                      ].map((tab) => (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          onClick={() => {
+                            setDbFilterTab(
+                              tab.id as 'all' | 'active' | 'inactive' | 'deleted'
+                            );
+                            setDbBooksLimit(100);
+                          }}
+                          className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap tabular-nums ${
+                            dbFilterTab === tab.id
+                              ? 'bg-white text-slate-900 shadow-xs'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          {tab.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={handleDownloadBackup}
+                      disabled={isBusy}
+                      className="inline-flex items-center gap-1.5 min-h-[38px] px-3.5 py-1.5 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-xl transition-colors whitespace-nowrap disabled:opacity-60"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>To‘liq bazani yuklab olish (.json)</span>
+                    </button>
+                  </div>
+                </div>
+                <p className="text-xs text-slate-500 tabular-nums">
+                  Natija: {filteredDbBooks.length} ta yozuv (o‘chirilgan kitoblarni «Tiklash» tugmasi orqali qayta faol katalogga qaytarish mumkin).
+                </p>
+              </div>
+
+              {/* Complete Database Table (Active, Inactive & Soft-Deleted Books) */}
+              <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
+                {filteredDbBooks.length === 0 ? (
+                  <div className="p-10 text-center text-sm text-slate-500">
+                    Tanlangan filtr bo‘yicha ma’lumotlar bazasida kitob topilmadi.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs sm:text-sm">
+                      <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 text-xs">
+                        <tr>
+                          <th className="py-3 px-4 font-semibold">Raqam</th>
+                          <th className="py-3 px-4 font-semibold">Kitob nomi va muallifi</th>
+                          <th className="py-3 px-4 font-semibold">Fan / Tur</th>
+                          <th className="py-3 px-4 font-semibold">Nusxa / Olish</th>
+                          <th className="py-3 px-4 font-semibold">Baza holati</th>
+                          <th className="py-3 px-4 font-semibold">Yangilangan</th>
+                          <th className="py-3 px-4 font-semibold text-right">Amallar</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {filteredDbBooks.slice(0, dbBooksLimit).map((book) => {
+                          const totalQty = Math.max(1, book.quantity || 1);
+                          const availQty = getBookAvailableCount(book);
+                          return (
+                            <tr
+                              key={book.id}
+                              className={
+                                book.isDeleted
+                                  ? 'bg-red-50/40 hover:bg-red-50/70'
+                                  : 'hover:bg-slate-50/80'
+                              }
+                            >
+                              <td className="py-3 px-4 font-mono font-semibold text-slate-900 tabular-nums whitespace-nowrap">
+                                {book.bookNumber}
+                              </td>
+                              <td className="py-3 px-4">
+                                <p className="font-semibold text-slate-900">{book.title}</p>
+                                <p className="text-xs text-slate-500">
+                                  {book.author || 'Muallif ko‘rsatilmagan'}
+                                </p>
+                              </td>
+                              <td className="py-3 px-4 text-xs text-slate-600">
+                                {book.category || 'Umumiy'}
+                              </td>
+                              <td className="py-3 px-4 font-mono text-xs tabular-nums text-slate-700 whitespace-nowrap">
+                                {availQty}/{totalQty} ta · {book.borrowCount || 0} marta
+                              </td>
+                              <td className="py-3 px-4 whitespace-nowrap">
+                                {book.isDeleted ? (
+                                  <span className="inline-flex items-center px-2.5 py-0.5 rounded-md text-xs font-bold bg-red-100 text-red-800">
+                                    O‘chirilgan
+                                  </span>
+                                ) : !book.isActive ? (
+                                  <span className="inline-flex items-center px-2.5 py-0.5 rounded-md text-xs font-semibold bg-slate-200 text-slate-700">
+                                    Faol emas
+                                  </span>
+                                ) : availQty > 0 ? (
+                                  <span className="inline-flex items-center px-2.5 py-0.5 rounded-md text-xs font-semibold bg-emerald-100 text-emerald-800">
+                                    Mavjud
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center px-2.5 py-0.5 rounded-md text-xs font-semibold bg-amber-100 text-amber-800">
+                                    Olingan
+                                  </span>
+                                )}
+                              </td>
+                              <td className="py-3 px-4 font-mono text-xs text-slate-500 tabular-nums whitespace-nowrap">
+                                {formatUzDateTime(book.updatedAt)}
+                              </td>
+                              <td className="py-3 px-4 text-right whitespace-nowrap">
+                                {book.isDeleted ? (
+                                  <button
+                                    type="button"
+                                    disabled={restoringBookId === book.id}
+                                    onClick={() => handleRestoreBook(book)}
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg transition-colors disabled:opacity-60"
+                                  >
+                                    <RotateCcw className="w-3.5 h-3.5" />
+                                    <span>
+                                      {restoringBookId === book.id ? 'Tiklanmoqda...' : 'Tiklash'}
+                                    </span>
+                                  </button>
+                                ) : (
+                                  <div className="inline-flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => setEditingBook(book)}
+                                      className="p-1.5 text-slate-600 hover:text-blue-700 hover:bg-blue-50 rounded-lg transition-colors"
+                                      title="Tahrirlash"
+                                    >
+                                      <Edit3 className="w-4 h-4" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleToggleActive(book)}
+                                      className="p-1.5 text-slate-600 hover:text-amber-700 hover:bg-amber-50 rounded-lg transition-colors"
+                                      title={book.isActive ? 'Faolsizlantirish' : 'Faollashtirish'}
+                                    >
+                                      <Power className="w-4 h-4" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setDeleteTarget(book)}
+                                      className="p-1.5 text-slate-600 hover:text-red-700 hover:bg-red-50 rounded-lg transition-colors"
+                                      title="O‘chirish"
+                                    >
+                                      <Trash2 className="w-4 h-4" />
+                                    </button>
+                                  </div>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              {filteredDbBooks.length > dbBooksLimit && (
+                <div className="flex flex-wrap items-center justify-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setDbBooksLimit((prev) => prev + 100)}
+                    className="min-h-[40px] px-5 py-2 text-xs font-semibold text-white bg-[#0F2942] hover:bg-slate-800 rounded-xl transition-colors tabular-nums"
+                  >
+                    Yana 100 ta ko‘rsatish (qolgan: {filteredDbBooks.length - dbBooksLimit} ta)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setDbBooksLimit((prev) =>
+                        filteredDbBooks.length > 1000
+                          ? Math.min(filteredDbBooks.length, prev + 500)
+                          : filteredDbBooks.length
+                      )
+                    }
+                    className="min-h-[40px] px-5 py-2 text-xs font-semibold text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 rounded-xl transition-colors tabular-nums"
+                  >
+                    {filteredDbBooks.length > 1000
+                      ? 'Yana 500 ta ko‘rsatish'
+                      : `Barchasini ko‘rsatish (${filteredDbBooks.length} ta)`}
+                  </button>
+                </div>
+              )}
+                </>
+              )}
             </div>
           )}
 

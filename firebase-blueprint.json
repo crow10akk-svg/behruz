@@ -127,6 +127,7 @@
         "borrowSignatureId": { "type": "string", "maxLength": 128 },
         "returnSignatureId": { "type": "string", "maxLength": 128 },
         "faceProfileId": { "type": "string", "maxLength": 128 },
+        "extraBookNumber": { "type": "string", "maxLength": 64 },
         "adminOverride": { "type": "boolean" },
         "createdAt": { "type": "string", "maxLength": 64 }
       },

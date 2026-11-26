@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Eraser, PenTool, RotateCcw } from 'lucide-react';
 
 interface SignaturePadProps {
@@ -12,40 +12,58 @@ export function SignaturePad({
 }: SignaturePadProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const isDrawingRef = useRef(false);
+  const hasStrokesRef = useRef(false);
   const lastPointRef = useRef<{ x: number; y: number } | null>(null);
   const [hasStrokes, setHasStrokes] = useState(false);
 
-  const initCanvas = () => {
+  const initCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const width = Math.max(rect.width, 320);
-    const height = Math.max(rect.height, 160);
+    const width = Math.max(Math.round(rect.width), 240);
+    const height = Math.max(Math.round(rect.height), 160);
     canvas.width = Math.round(width * dpr);
     canvas.height = Math.round(height * dpr);
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    ctx.scale(dpr, dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, width, height);
     ctx.strokeStyle = '#0f172a';
     ctx.lineWidth = 2.6;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
-  };
+  }, []);
 
   useEffect(() => {
     initCanvas();
-  }, []);
+    const canvas = canvasRef.current;
+    if (!canvas || typeof ResizeObserver === 'undefined') return;
+    let prevW = Math.round(canvas.getBoundingClientRect().width);
+    const ro = new ResizeObserver(() => {
+      const nextW = Math.round(canvas.getBoundingClientRect().width);
+      if (nextW > 0 && Math.abs(nextW - prevW) > 8 && !hasStrokesRef.current) {
+        prevW = nextW;
+        initCanvas();
+      }
+    });
+    ro.observe(canvas);
+    return () => ro.disconnect();
+  }, [initCanvas]);
 
   const getPoint = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas) return { x: 0, y: 0 };
     const rect = canvas.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const logicalW = canvas.width / dpr;
+    const logicalH = canvas.height / dpr;
+    const scaleX = rect.width > 0 ? logicalW / rect.width : 1;
+    const scaleY = rect.height > 0 ? logicalH / rect.height : 1;
     return {
-      x: e.clientX - rect.left,
-      y: e.clientY - rect.top,
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top) * scaleY,
     };
   };
 
@@ -53,7 +71,11 @@ export function SignaturePad({
     e.preventDefault();
     const canvas = canvasRef.current;
     if (!canvas) return;
-    canvas.setPointerCapture(e.pointerId);
+    try {
+      canvas.setPointerCapture(e.pointerId);
+    } catch {
+      // Ignore if pointer capture is unsupported on some mobile webviews
+    }
     isDrawingRef.current = true;
     const pt = getPoint(e);
     lastPointRef.current = pt;
@@ -65,7 +87,8 @@ export function SignaturePad({
       ctx.fillStyle = '#0f172a';
       ctx.fill();
     }
-    if (!hasStrokes) {
+    if (!hasStrokesRef.current) {
+      hasStrokesRef.current = true;
       setHasStrokes(true);
     }
   };
@@ -85,17 +108,27 @@ export function SignaturePad({
     lastPointRef.current = pt;
   };
 
-  const finishStroke = () => {
+  const finishStroke = (e?: React.PointerEvent<HTMLCanvasElement>) => {
     if (!isDrawingRef.current) return;
     isDrawingRef.current = false;
     lastPointRef.current = null;
     const canvas = canvasRef.current;
-    if (canvas && hasStrokes) {
+    if (canvas && e) {
+      try {
+        if (canvas.hasPointerCapture?.(e.pointerId)) {
+          canvas.releasePointerCapture(e.pointerId);
+        }
+      } catch {
+        // Ignore
+      }
+    }
+    if (canvas && hasStrokesRef.current) {
       onChange(canvas.toDataURL('image/png'));
     }
   };
 
   const handleClear = () => {
+    hasStrokesRef.current = false;
     initCanvas();
     setHasStrokes(false);
     onChange(null);
